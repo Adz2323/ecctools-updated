@@ -30,7 +30,7 @@ const char *version = "0.1.211009";
 const char *EC_constant_N = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141";
 const char *EC_constant_P = "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f";
 const char *EC_constant_Gx = "8641998106234453aa5f9d6a3178f4f7b812e00b817a776265dfdd31b93e29a9";
-const char *EC_constant_Gy = "388f7b0f632de8140fe337e62a37f3566500a99934c2231b6cb9fd7584b8e672";
+const char *EC_constant_Gy = "37d769c6c2506e064349515e1a00a36d7fda7ca9306d1012a8cc089f25d065d0";
 
 char *str_output = NULL;
 char *str_input = NULL;
