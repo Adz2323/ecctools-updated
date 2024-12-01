@@ -1,136 +1,38 @@
-# Compiler settings
-CC=gcc
-CXX=g++
+# Default target for building pubdiv
+default:
+	g++ -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Wno-deprecated-copy -Ofast -ftree-vectorize -flto -c bloom/bloom.cpp -o bloom.o
+	gcc -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Wno-unused-parameter -Ofast -ftree-vectorize -c base58/base58.c -o base58.o
+	gcc -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Ofast -ftree-vectorize -c rmd160/rmd160.c -o rmd160.o
+	g++ -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Wno-deprecated-copy -Ofast -ftree-vectorize -c sha3/sha3.c -o sha3.o
+	g++ -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Wno-deprecated-copy -Ofast -ftree-vectorize -c sha3/keccak.c -o keccak.o
+	gcc -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Ofast -ftree-vectorize -c xxhash/xxhash.c -o xxhash.o
+	g++ -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Wno-deprecated-copy -Ofast -ftree-vectorize -c util.c -o util.o
+	g++ -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Wno-deprecated-copy -Ofast -ftree-vectorize -c secp256k1/Int.cpp -o Int.o
+	g++ -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Wno-deprecated-copy -Ofast -ftree-vectorize -c secp256k1/Point.cpp -o Point.o
+	g++ -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Wno-deprecated-copy -Ofast -ftree-vectorize -c secp256k1/SECP256K1.cpp -o SECP256K1.o
+	g++ -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Wno-deprecated-copy -Ofast -ftree-vectorize -c secp256k1/IntMod.cpp -o IntMod.o
+	g++ -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Wno-deprecated-copy -Ofast -ftree-vectorize -flto -c secp256k1/Random.cpp -o Random.o
+	g++ -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Wno-deprecated-copy -Ofast -ftree-vectorize -flto -c secp256k1/IntGroup.cpp -o IntGroup.o
+	g++ -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Wno-deprecated-copy -Ofast -o hash/ripemd160.o -ftree-vectorize -flto -c hash/ripemd160.cpp
+	g++ -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Wno-deprecated-copy -Ofast -o hash/sha256.o -ftree-vectorize -flto -c hash/sha256.cpp
+	g++ -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Wno-deprecated-copy -Ofast -o hash/ripemd160_sse.o -ftree-vectorize -flto -c hash/ripemd160_sse.cpp
+	g++ -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Wno-deprecated-copy -Ofast -o hash/sha256_sse.o -ftree-vectorize -flto -c hash/sha256_sse.cpp
+	g++ -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Wno-deprecated-copy -Ofast -ftree-vectorize -flto -std=c++11 -I/usr/local/include -c keydivision.c -o div.o
+	g++ -m64 -march=native -mtune=native -mssse3 -pthread -Ofast -flto \
+		bloom.o base58.o rmd160.o sha3.o keccak.o xxhash.o util.o \
+		Int.o Point.o SECP256K1.o IntMod.o Random.o IntGroup.o \
+		hash/ripemd160.o hash/sha256.o hash/ripemd160_sse.o hash/sha256_sse.o \
+		div.o -o div -lgmp
+	rm -r *.o
 
-# Detect OS type
-UNAME_S := $(shell uname -s)
+# Debug target for test.cpp
+debug:
+	g++ -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -g -std=c++11 -o DebugTest \
+		secp256k1/Int.cpp secp256k1/Point.cpp secp256k1/SECP256K1.cpp secp256k1/IntMod.cpp \
+		secp256k1/Random.cpp secp256k1/IntGroup.cpp hash/ripemd160.cpp hash/sha256.cpp \
+		hash/ripemd160_sse.cpp hash/sha256_sse.cpp util.c secp256k1/test.cpp
 
-# Detect number of CPU cores based on OS
-ifeq ($(UNAME_S),Darwin) # macOS
-    NPROC=$(shell sysctl -n hw.ncpu)
-    UNSUPPORTED_FLAGS=-fuse-linker-plugin -fprefetch-loop-arrays -fno-semantic-interposition
-else
-    NPROC=$(shell nproc)
-    UNSUPPORTED_FLAGS=
-endif
-
-# Include directories
-INCLUDES=-I. -I./sha256 -I./base58 -I./rmd160 -I./xxhash -I./bloom
-
-# XXHash Implementation define
-XXH_FLAGS=-DXXH_PRIVATE_API -DXXH_IMPLEMENTATION
-
-# Detect available CPU features
-HAS_AVX2 := $(shell $(CC) -mavx2 -dM -E - < /dev/null 2>/dev/null | grep -c "AVX2")
-HAS_AVX512 := $(shell $(CC) -mavx512f -dM -E - < /dev/null 2>/dev/null | grep -c "AVX512F")
-HAS_SSE2 := $(shell $(CC) -msse2 -dM -E - < /dev/null 2>/dev/null | grep -c "SSE2")
-
-# Set architecture-specific flags
-ARCH_FLAGS=-m64 -march=native -mtune=native
-
-ifeq ($(HAS_AVX512),1)
-    ARCH_FLAGS += -mavx512f -mavx512vl -mavx512bw -mavx512dq
-else ifeq ($(HAS_AVX2),1)
-    ARCH_FLAGS += -mavx2
-else ifeq ($(HAS_SSE2),1)
-    ARCH_FLAGS += -msse2
-endif
-
-# Advanced optimization flags
-OPTFLAGS=$(ARCH_FLAGS) -Ofast -ftree-vectorize -flto \
-         $(filter-out $(UNSUPPORTED_FLAGS), \
-         -funroll-loops -pipe -fomit-frame-pointer \
-         -fmerge-all-constants -fno-stack-protector \
-         -fno-math-errno -fno-trapping-math) \
-         -DXXH_INLINE_ALL
-
-# Debug flags
-ifeq ($(DEBUG),1)
-    OPTFLAGS=-g -O0 -DDEBUG
-endif
-
-# Warning flags
-ifeq ($(UNAME_S),Darwin)
-    WFLAGS=-Wall -Wextra -Wno-deprecated-copy -Wno-unused-result -Wno-unknown-pragmas
-else
-    WFLAGS=-Wall -Wextra -Wno-deprecated-copy -Wno-unused-result
-endif
-
-# C specific flags
-CFLAGS=$(OPTFLAGS) $(WFLAGS) $(INCLUDES) $(XXH_FLAGS) -std=c11
-
-# C++ specific flags
-CXXFLAGS=$(OPTFLAGS) $(WFLAGS) $(INCLUDES) $(XXH_FLAGS) -std=c++11
-
-# Linker flags
-LDFLAGS=$(OPTFLAGS)
-LIBS=-lgmp -lpthread -lm
-
-# Output binary
-TARGET=keydivision
-
-# Source files
-C_SOURCES=sha256/sha256.c \
-        base58/base58.c \
-        rmd160/rmd160.c \
-        gmpecc.c \
-        util.c \
-        keydivision.c \
-        xxhash/xxhash.c
-
-CPP_SOURCES=bloom/bloom.cpp
-
-# Generate object file names
-C_OBJECTS=$(C_SOURCES:.c=.o)
-CPP_OBJECTS=$(CPP_SOURCES:.cpp=.o)
-OBJECTS=$(C_OBJECTS) $(CPP_OBJECTS)
-
-# Generate dependency files
-DEPS=$(OBJECTS:.o=.d)
-
-# Default target
-all: $(TARGET)
-
-# Include dependency files
--include $(DEPS)
-
-# Compile C files
-%.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
-
-# Compile C++ files
-%.o: %.cpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-# Link everything together
-$(TARGET): $(OBJECTS)
-	$(CXX) $(LDFLAGS) -o $@ $(OBJECTS) $(LIBS)
-
-# Clean target
 clean:
-	rm -f $(TARGET) $(OBJECTS) $(DEPS)
-	rm -f *~ *.d
+	rm -f *.o div DebugEC DebugTest hash/*.o
 
-# Deep clean
-distclean: clean
-	rm -f *.dat
-	rm -f checkpoint_*.dat
-
-# Run with optimal thread count
-run: $(TARGET)
-	./$(TARGET) -t $(NPROC)
-
-# Memory check
-memcheck: $(TARGET)
-	valgrind --leak-check=full --show-leak-kinds=all ./$(TARGET)
-
-.PHONY: all clean distclean run memcheck config
-
-# Print build configuration
-config:
-	@echo "C Compiler: $(CC)"
-	@echo "C++ Compiler: $(CXX)"
-	@echo "CPU Cores: $(NPROC)"
-	@echo "Architecture Flags: $(ARCH_FLAGS)"
-	@echo "Optimization Flags: $(OPTFLAGS)"
-	@echo "Operating System: $(UNAME_S)"
+.PHONY: default debug clean
