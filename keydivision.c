@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <signal.h>
 #include <pthread.h>
 #include <unistd.h>
 #include "secp256k1/SECP256k1.h"
