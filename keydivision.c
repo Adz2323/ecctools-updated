@@ -7,21 +7,30 @@
 #include <unistd.h>
 #include <iomanip>
 #include <stdexcept>
+#include <sys/mman.h>
+#include <fcntl.h>
 #include "secp256k1/SECP256k1.h"
 #include "secp256k1/Point.h"
 #include "secp256k1/Int.h"
 #include "bloom/bloom.h"
 #include "xxhash/xxhash.h"
 
-#define BATCH_SIZE 100000
+#define BATCH_SIZE 1000000
 #define MAX_THREADS 256
 #define MAX_BITS 40
 pthread_mutex_t bit_reduce_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Forward declarations
-class OutputManager;
-bool perform_bit_reduction(Point *pubkey, int nbits, const char *search_pubkey, int num_threads);
-void autosub_mode(Point *input_pubkey, const char *search_pubkey, int num_threads, int argc, char **argv);
+// Add these function declarations at the start of Part 3, after the global variables
+static void init_bloom_filter(const char *target_pubkey);
+static void cleanup_bloom();
+static void handle_signal(int sig);
+static uint64_t load_checkpoint(const char *input_pubkey, const char *search_pubkey, int nbits);
+static void delete_checkpoint();
+static void *thread_search(void *arg);
+static void *batch_bit_reduction(void *arg);
+static bool perform_bit_reduction(Point *pubkey, int nbits, const char *search_pubkey, int num_threads);
+static void spiral_mode(Point *input_pubkey, const char *search_pubkey, int num_threads, bool save_only);
+static void autosub_mode(Point *input_pubkey, const char *search_pubkey, int num_threads, int argc, char **argv);
 
 class OutputManager
 {
@@ -52,10 +61,10 @@ public:
         printf("║ Mode: %-51s║\n", mode);
         printf("║ Threads: %-48d║\n", threads);
         printf("╠══════════════════════════════════════════════════════════╣\n");
-        char *start_str = const_cast<Int &>(start_range).GetBase10();
-        char *max_str = const_cast<Int &>(max_range).GetBase10();
-        printf("║ Range Start: %-45s║\n", start_str);
-        printf("║ Range End:   %-45s║\n", max_str);
+        Int non_const_start(start_range);
+        Int non_const_max(max_range);
+        printf("║ Range Start: %-45s║\n", non_const_start.GetBase10());
+        printf("║ Range End:   %-45s║\n", non_const_max.GetBase10());
         printf("╚══════════════════════════════════════════════════════════╝\n\n");
         start_time = time(NULL);
         initialized = true;
@@ -115,6 +124,92 @@ public:
         pthread_mutex_lock(&output_mutex);
         printf("\n");
         pthread_mutex_unlock(&output_mutex);
+    }
+};
+
+class SubtractionStore
+{
+private:
+    int fd;
+    size_t filesize;
+    void *mapped_data;
+    size_t current_position;
+    const size_t ENTRY_SIZE = 32;
+
+public:
+    SubtractionStore(const char *filename)
+    {
+        fd = open(filename, O_RDWR | O_CREAT, 0644);
+        if (fd == -1)
+        {
+            perror("Error opening subtraction store");
+            return;
+        }
+
+        filesize = 1024 * 1024 * 10;
+        ftruncate(fd, filesize);
+
+        mapped_data = mmap(NULL, filesize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (mapped_data == MAP_FAILED)
+        {
+            perror("Error mapping subtraction store");
+            close(fd);
+            return;
+        }
+
+        current_position = lseek(fd, 0, SEEK_END);
+    }
+
+    ~SubtractionStore()
+    {
+        if (mapped_data != MAP_FAILED)
+        {
+            munmap(mapped_data, filesize);
+        }
+        if (fd != -1)
+        {
+            close(fd);
+        }
+    }
+
+    void add(const Int &subtraction)
+    {
+        Int non_const_copy(subtraction);
+        char *subtraction_str = non_const_copy.GetBase10();
+        size_t len = strlen(subtraction_str);
+
+        if (current_position + ENTRY_SIZE > filesize)
+        {
+            munmap(mapped_data, filesize);
+            filesize *= 2;
+            ftruncate(fd, filesize);
+            mapped_data = mmap(NULL, filesize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            if (mapped_data == MAP_FAILED)
+            {
+                perror("Error remapping subtraction store");
+                return;
+            }
+        }
+
+        memcpy((char *)mapped_data + current_position, subtraction_str, len);
+        current_position += ENTRY_SIZE;
+    }
+
+    bool exists(const Int &subtraction)
+    {
+        Int non_const_copy(subtraction);
+        char *subtraction_str = non_const_copy.GetBase10();
+        char *data = (char *)mapped_data;
+        size_t entries = current_position / ENTRY_SIZE;
+
+        for (size_t i = 0; i < entries; i++)
+        {
+            if (strncmp(data + (i * ENTRY_SIZE), subtraction_str, strlen(subtraction_str)) == 0)
+            {
+                return true;
+            }
+        }
+        return false;
     }
 };
 
@@ -216,12 +311,6 @@ struct BatchThreadData
                found_pubkey != nullptr &&
                mutex != nullptr;
     }
-
-    bool isIndexValid(int index) const
-    {
-        return index >= batch_start && index < batch_end &&
-               index < BATCH_SIZE;
-    }
 };
 
 // Global instances
@@ -241,60 +330,170 @@ bool use_bloom = false;
 const char *SUBTRACTION_START = "21778071482940061661655974875633165533184";
 const char *SUBTRACTION_MAX = "43556142965880123323311949751266331066367";
 
-// Helper functions for thread management
-void initThreadData(BatchThreadData *data, int num_threads)
+// Spiral Distribution implementation
+class SpiralDistributor
 {
-    if (!data)
-        return;
+private:
+    Int start_range;
+    Int end_range;
+    Int middle;
+    Int current_offset;
+    Int step_size;
+    Int remaining_up;
+    Int remaining_down;
+    SubtractionStore store;
+    bool range_exhausted;
 
-    pthread_mutex_t *shared_mutex = new pthread_mutex_t;
-    pthread_mutex_init(shared_mutex, NULL);
-    bool *shared_found = new bool(false);
-
-    int keys_per_thread = BATCH_SIZE / num_threads;
-    int remainder = BATCH_SIZE % num_threads;
-    int current_start = 0;
-
-    for (int t = 0; t < num_threads; t++)
+    void initializeRanges()
     {
-        data[t].thread_id = t;
-        data[t].batch_start = current_start;
-        data[t].batch_end = current_start + keys_per_thread + (t < remainder ? 1 : 0);
-        data[t].mutex = shared_mutex;
-        data[t].found = shared_found;
-        current_start = data[t].batch_end;
+        remaining_up.Set(&end_range);
+        remaining_up.Sub(&middle);
+
+        remaining_down.Set(&middle);
+        remaining_down.Sub(&start_range);
+
+        step_size.Set(&end_range);
+        step_size.Sub(&start_range);
+        Int divisor;
+        divisor.SetInt32(1000);
+        step_size.Div(&divisor);
+
+        if (step_size.IsZero())
+        {
+            step_size.SetInt32(1);
+        }
+
+        range_exhausted = false;
     }
-}
 
-void cleanupThreadData(BatchThreadData *data, int num_threads)
-{
-    if (!data)
-        return;
-
-    if (num_threads > 0 && data[0].mutex)
+    bool isValidSubtraction(const Int &value)
     {
-        pthread_mutex_destroy(data[0].mutex);
-        delete data[0].mutex;
-        delete data[0].found;
+        Int non_const_value(value);
+        if (non_const_value.IsLower(&start_range) || non_const_value.IsGreater(&end_range))
+        {
+            return false;
+        }
+        return !store.exists(value);
     }
-}
 
-void init_bloom_filter(const char *target_pubkey)
-{
-    bloom_wrapper.init(target_pubkey);
-    use_bloom = true;
-}
-
-void cleanup_bloom()
-{
-    if (use_bloom)
+    void adjustStepSize()
     {
-        bloom_wrapper.cleanup();
-        use_bloom = false;
-    }
-}
+        Int two;
+        two.SetInt32(2);
+        step_size.Div(&two);
 
-void handle_signal(int sig)
+        if (step_size.IsZero())
+        {
+            range_exhausted = true;
+        }
+
+        Int non_const_step(step_size);
+        printf("\n[+] Adjusting step size to: %s\n", non_const_step.GetBase10());
+    }
+
+public:
+    SpiralDistributor(const char *start, const char *end)
+        : store("spiral_subtractions.bin")
+    {
+        start_range.SetBase10(start);
+        end_range.SetBase10(end);
+
+        middle.Set(&end_range);
+        middle.Add(&start_range);
+        Int two;
+        two.SetInt32(2);
+        middle.Div(&two);
+
+        current_offset.SetInt32(0);
+        initializeRanges();
+    }
+
+    bool getSpiralBatch(std::vector<Int> &subtractions, int batch_size)
+    {
+        if (range_exhausted)
+        {
+            printf("\n[+] Range has been exhausted - all possible values within step size have been tried\n");
+            return false;
+        }
+
+        Int candidate;
+        int added = 0;
+        int consecutive_failures = 0;
+        const int MAX_CONSECUTIVE_FAILURES = 1000;
+
+        while (added < batch_size)
+        {
+            // Try upward from middle
+            candidate.Set(&middle);
+            candidate.Add(&current_offset);
+
+            if (isValidSubtraction(candidate))
+            {
+                subtractions[added].Set(&candidate);
+                store.add(candidate);
+                added++;
+                consecutive_failures = 0;
+            }
+            else
+            {
+                consecutive_failures++;
+            }
+
+            if (added < batch_size)
+            {
+                // Try downward from middle
+                candidate.Set(&middle);
+                candidate.Sub(&current_offset);
+
+                if (isValidSubtraction(candidate))
+                {
+                    subtractions[added].Set(&candidate);
+                    store.add(candidate);
+                    added++;
+                    consecutive_failures = 0;
+                }
+                else
+                {
+                    consecutive_failures++;
+                }
+            }
+
+            current_offset.Add(&step_size);
+
+            if (consecutive_failures >= MAX_CONSECUTIVE_FAILURES)
+            {
+                adjustStepSize();
+                consecutive_failures = 0;
+                if (range_exhausted)
+                {
+                    break;
+                }
+            }
+        }
+
+        return added == batch_size;
+    }
+
+    void displayProgress()
+    {
+        Int non_const_offset(current_offset);
+        Int non_const_step(step_size);
+        printf("\nSpiral Search Progress:\n");
+        printf("Current offset from middle: %s\n", non_const_offset.GetBase10());
+        printf("Current step size: %s\n", non_const_step.GetBase10());
+    }
+};
+
+// Function declarations
+static void handle_signal(int sig);
+static void *thread_search(void *arg);
+static void *batch_bit_reduction(void *arg);
+static bool perform_bit_reduction(Point *pubkey, int nbits, const char *search_pubkey, int num_threads);
+static void spiral_mode(Point *input_pubkey, const char *search_pubkey, int num_threads, bool save_only);
+static void autosub_mode(Point *input_pubkey, const char *search_pubkey, int num_threads, int argc, char **argv);
+
+// Signal and checkpoint handling
+static void handle_signal(int sig)
 {
     if (sig == SIGINT)
     {
@@ -314,7 +513,22 @@ void handle_signal(int sig)
     }
 }
 
-uint64_t load_checkpoint(const char *input_pubkey, const char *search_pubkey, int nbits)
+static void init_bloom_filter(const char *target_pubkey)
+{
+    bloom_wrapper.init(target_pubkey);
+    use_bloom = true;
+}
+
+static void cleanup_bloom()
+{
+    if (use_bloom)
+    {
+        bloom_wrapper.cleanup();
+        use_bloom = false;
+    }
+}
+
+static uint64_t load_checkpoint(const char *input_pubkey, const char *search_pubkey, int nbits)
 {
     snprintf(checkpoint_filename, sizeof(checkpoint_filename), "checkpoint_%d.dat", nbits);
 
@@ -339,13 +553,13 @@ uint64_t load_checkpoint(const char *input_pubkey, const char *search_pubkey, in
     return 0;
 }
 
-void delete_checkpoint()
+static void delete_checkpoint()
 {
     remove(checkpoint_filename);
 }
 
-// Thread processing functions
-void *thread_search(void *arg)
+// Thread functions
+static void *thread_search(void *arg)
 {
     ThreadData *data = (ThreadData *)arg;
     if (!data->isValid())
@@ -412,77 +626,110 @@ void *thread_search(void *arg)
     return NULL;
 }
 
-void *batch_bit_reduction(void *arg)
+static void *batch_bit_reduction(void *arg)
 {
     BatchThreadData *data = (BatchThreadData *)arg;
-
-    // Debug output - uncomment if needed
-    /*
-    printf("Thread %d starting\n", data->thread_id);
-    printf("Thread %d range: %d to %d\n", data->thread_id, data->batch_start, data->batch_end);
-    */
-
-    if (!data || !data->subtractions || !data->pubkeys || !data->found)
-    {
-        // printf("Thread %d: NULL pointer detected\n", data->thread_id);
+    if (!data->isValid())
         return NULL;
-    }
 
     for (int i = data->batch_start; i < data->batch_end && !(*data->found); i++)
     {
         try
         {
-            // Debug output - uncomment if needed
-            /*
-            printf("\rThread %d processing subtraction %d", data->thread_id, i);
-            fflush(stdout);
-            */
+            Point current_pubkey = data->pubkeys[i];
+            char pubkey_hex[132];
+            secp.GetPublicKeyHex(true, current_pubkey, pubkey_hex);
 
-            for (int bits = 1; bits <= 20 && !(*data->found); bits++)
+            if (!use_bloom || bloom_wrapper.check(pubkey_hex, strlen(pubkey_hex)))
             {
-                pthread_mutex_lock(&bit_reduce_mutex);
-                bool result = perform_bit_reduction(&data->pubkeys[i], bits, data->search_pubkey, 1);
-                pthread_mutex_unlock(&bit_reduce_mutex);
-
-                if (result)
+                if (strcmp(pubkey_hex, data->search_pubkey) == 0)
                 {
-                    pthread_mutex_lock(&bit_reduce_mutex);
+                    pthread_mutex_lock(data->mutex);
                     if (!(*data->found))
                     {
                         *data->found = true;
                         data->found_subtraction->Set(&data->subtractions[i]);
-                        data->found_pubkey->Set(data->pubkeys[i]);
-                        // printf("\nThread %d found match\n", data->thread_id);
+                        data->found_pubkey->Set(current_pubkey);
                     }
-                    pthread_mutex_unlock(&bit_reduce_mutex);
+                    pthread_mutex_unlock(data->mutex);
                     return NULL;
                 }
             }
         }
         catch (const std::exception &e)
         {
-            // Debug output - uncomment if needed
-            /*
-            printf("\nThread %d error at subtraction %d: %s\n",
-                   data->thread_id, i, e.what());
-            */
+            printf("\nError processing subtraction %d: %s\n", i, e.what());
         }
     }
-
-    // printf("\nThread %d completed\n", data->thread_id);
     return NULL;
 }
 
-bool perform_bit_reduction(Point *pubkey, int nbits, const char *search_pubkey, int num_threads)
+// Helper function for thread setup
+static void initThreadData(BatchThreadData *data, int num_threads)
 {
-    signal(SIGINT, handle_signal);
+    if (!data)
+        return;
 
+    pthread_mutex_t *shared_mutex = new pthread_mutex_t;
+    pthread_mutex_init(shared_mutex, NULL);
+    bool *shared_found = new bool(false);
+
+    int keys_per_thread = BATCH_SIZE / num_threads;
+    int remainder = BATCH_SIZE % num_threads;
+    int current_start = 0;
+
+    for (int t = 0; t < num_threads; t++)
+    {
+        data[t].thread_id = t;
+        data[t].batch_start = current_start;
+        data[t].batch_end = current_start + keys_per_thread + (t < remainder ? 1 : 0);
+        data[t].mutex = shared_mutex;
+        data[t].found = shared_found;
+        current_start = data[t].batch_end;
+    }
+}
+
+static void cleanupThreadData(BatchThreadData *data, int num_threads)
+{
+    if (!data)
+        return;
+
+    if (num_threads > 0 && data[0].mutex)
+    {
+        pthread_mutex_destroy(data[0].mutex);
+        delete data[0].mutex;
+        delete data[0].found;
+    }
+}
+
+static void save_subtraction(const Point &pubkey, const Int &subtraction, FILE *file)
+{
+    if (!file)
+        return;
+
+    char pubkey_hex[132];
+    Point non_const_pubkey = pubkey;
+    secp.GetPublicKeyHex(true, non_const_pubkey, pubkey_hex);
+    Int non_const_subtraction(subtraction);
+    char *subtraction_str = non_const_subtraction.GetBase10();
+
+    fprintf(file, "%s # %s\n", pubkey_hex, subtraction_str);
+    if (ferror(file))
+    {
+        printf("\n[+] Error writing to file\n");
+        clearerr(file);
+    }
+}
+
+static bool perform_bit_reduction(Point *pubkey, int nbits, const char *search_pubkey, int num_threads)
+{
     if (!pubkey || !search_pubkey || nbits <= 0 || num_threads <= 0)
     {
         printf("Invalid parameters for bit reduction\n");
         return false;
     }
 
+    signal(SIGINT, handle_signal);
     secp.GetPublicKeyHex(false, *pubkey, checkpoint_pubkey);
     strncpy(checkpoint_target, search_pubkey, sizeof(checkpoint_target) - 1);
     checkpoint_nbits = nbits;
@@ -547,10 +794,7 @@ bool perform_bit_reduction(Point *pubkey, int nbits, const char *search_pubkey, 
                 thread_args[t].end_range.Add(&chunk_size);
             }
 
-            if (pthread_create(&threads[t], NULL, thread_search, &thread_args[t]) != 0)
-            {
-                throw std::runtime_error("Failed to create thread");
-            }
+            pthread_create(&threads[t], NULL, thread_search, &thread_args[t]);
         }
 
         for (int t = 0; t < num_threads; t++)
@@ -572,18 +816,175 @@ bool perform_bit_reduction(Point *pubkey, int nbits, const char *search_pubkey, 
     return found;
 }
 
-void save_subtraction(const Point &pubkey, const Int &subtraction, FILE *file)
+static void spiral_mode(Point *input_pubkey, const char *search_pubkey, int num_threads, bool save_only = false)
 {
-    char pubkey_hex[132];
-    Point non_const_pubkey = pubkey; // Create non-const copy
-    secp.GetPublicKeyHex(true, non_const_pubkey, pubkey_hex);
+    if (!input_pubkey || !search_pubkey || num_threads <= 0)
+        return;
 
-    // Create non-const copy for GetBase10
-    Int non_const_subtraction = subtraction;
-    fprintf(file, "%s # %s\n", pubkey_hex, non_const_subtraction.GetBase10());
+    signal(SIGINT, handle_signal);
+    FILE *output_file = nullptr;
+    if (save_only)
+    {
+        output_file = fopen("135.txt", "w");
+        if (!output_file)
+        {
+            printf("Error: Could not open 135.txt for writing\n");
+            return;
+        }
+    }
+
+    Int start_range, end_range, middle, current;
+    start_range.SetBase10(SUBTRACTION_START);
+    end_range.SetBase10(SUBTRACTION_MAX);
+
+    // Calculate middle point
+    middle.Set(&end_range);
+    middle.Add(&start_range);
+    Int two;
+    two.SetInt32(2);
+    middle.Div(&two);
+
+    // Calculate step size
+    Int step;
+    step.Set(&end_range);
+    step.Sub(&start_range);
+    Int thousand;
+    thousand.SetInt32(1000);
+    step.Div(&thousand);
+
+    // Initialize vectors and thread data
+    std::vector<Int> subtractions(BATCH_SIZE);
+    std::vector<Point> pubkeys(BATCH_SIZE);
+    std::vector<pthread_t> threads(num_threads);
+    std::vector<BatchThreadData> thread_data(num_threads);
+    uint64_t total_saved = 0;
+    bool found = false;
+    Int found_subtraction;
+    Point found_pubkey;
+    uint64_t batch_number = 0;
+
+    output.initialize("Spiral Search", num_threads, start_range, end_range);
+
+    int direction = 1; // 1 for up, -1 for down
+    current.Set(&middle);
+    printf("\n[+] Starting spiral search from middle point\n");
+
+    while (!should_exit && !found)
+    {
+        batch_number++;
+        int added = 0;
+
+        while (added < BATCH_SIZE && !should_exit)
+        {
+            if (direction == 1)
+            {
+                current.Add(&step);
+                if (current.IsGreater(&end_range))
+                {
+                    direction = -1;
+                    continue;
+                }
+            }
+            else
+            {
+                current.Sub(&step);
+                if (current.IsLower(&start_range))
+                {
+                    direction = 1;
+                    continue;
+                }
+            }
+
+            subtractions[added].Set(&current);
+            Point subtraction_point = secp.ComputePublicKey(&subtractions[added]);
+            Point negated_point = secp.Negation(subtraction_point);
+            pubkeys[added] = secp.AddDirect(*input_pubkey, negated_point);
+
+            if (save_only && output_file)
+            {
+                save_subtraction(pubkeys[added], subtractions[added], output_file);
+                total_saved++;
+                if (total_saved % 1000 == 0)
+                {
+                    printf("\r[+] Saved %llu subtractions", total_saved);
+                    fflush(stdout);
+                    fflush(output_file);
+                }
+            }
+            else
+            {
+                output.updateSubtractionGeneration(added + 1, BATCH_SIZE); // Fixed here: i -> added
+            }
+            added++;
+        }
+
+        if (save_only)
+        {
+            continue;
+        }
+
+        // Search using threads
+        pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+        bool batch_found = false;
+
+        int keys_per_thread = BATCH_SIZE / num_threads;
+        int remainder = BATCH_SIZE % num_threads;
+        int current_start = 0;
+
+        for (int t = 0; t < num_threads; t++)
+        {
+            thread_data[t].thread_id = t;
+            thread_data[t].subtractions = subtractions.data();
+            thread_data[t].pubkeys = pubkeys.data();
+            thread_data[t].input_pubkey = input_pubkey;
+            thread_data[t].search_pubkey = search_pubkey;
+            thread_data[t].found = &batch_found;
+            thread_data[t].found_subtraction = &found_subtraction;
+            thread_data[t].found_pubkey = &found_pubkey;
+            thread_data[t].mutex = &mutex;
+            thread_data[t].batch_start = current_start;
+            thread_data[t].batch_end = current_start + keys_per_thread + (t < remainder ? 1 : 0);
+            current_start = thread_data[t].batch_end;
+
+            pthread_create(&threads[t], NULL, batch_bit_reduction, &thread_data[t]);
+        }
+
+        for (int t = 0; t < num_threads; t++)
+        {
+            pthread_join(threads[t], NULL);
+        }
+
+        if (batch_found)
+        {
+            found = true;
+            printf("\n[+] Found match with subtraction: %s\n", found_subtraction.GetBase10());
+            char pubkey_hex[132];
+            secp.GetPublicKeyHex(true, found_pubkey, pubkey_hex);
+            printf("[+] Matching public key: %s\n", pubkey_hex);
+        }
+
+        pthread_mutex_destroy(&mutex);
+
+        if (batch_number % 10 == 0)
+        {
+            printf("\nSpiral Search Progress:\n");
+            Int non_const_current(current);
+            Int non_const_step(step);
+            printf("Current value: %s\n", non_const_current.GetBase10());
+            printf("Step size: %s\n", non_const_step.GetBase10());
+            printf("Total subtractions: %llu\n", total_saved);
+        }
+    }
+
+    if (save_only && output_file)
+    {
+        fflush(output_file);
+        fclose(output_file);
+        printf("\n[+] Successfully saved %llu subtractions to 135.txt\n", total_saved);
+    }
 }
 
-void autosub_mode(Point *input_pubkey, const char *search_pubkey, int num_threads, int argc, char **argv)
+static void autosub_mode(Point *input_pubkey, const char *search_pubkey, int num_threads, int argc, char **argv)
 {
     if (!input_pubkey || !search_pubkey || num_threads <= 0)
         return;
@@ -591,7 +992,6 @@ void autosub_mode(Point *input_pubkey, const char *search_pubkey, int num_thread
     bool save_only = false;
     FILE *output_file = nullptr;
 
-    // Check if -k flag is present
     for (int i = 1; i < argc; i++)
     {
         if (strcmp(argv[i], "-k") == 0)
@@ -652,7 +1052,6 @@ void autosub_mode(Point *input_pubkey, const char *search_pubkey, int num_thread
         if (should_exit || save_only)
             break;
 
-        // Rest of the original autosub_mode code for searching...
         int keys_per_thread = BATCH_SIZE / num_threads;
         int remainder = BATCH_SIZE % num_threads;
         int current_start = 0;
@@ -720,7 +1119,10 @@ int main(int argc, char **argv)
         printf("║ %s --reduce <pubkey> <nbits> <search_pubkey> [-t threads]║\n", argv[0]);
         printf("║                                                          ║\n");
         printf("║ Autosub mode:                                           ║\n");
-        printf("║ %s --autosub <pubkey> <search_pubkey> [-t threads]      ║\n", argv[0]);
+        printf("║ %s --autosub <pubkey> <search_pubkey> [-t threads] [-k]  ║\n", argv[0]);
+        printf("║                                                          ║\n");
+        printf("║ Spiral mode:                                            ║\n");
+        printf("║ %s --spiral <pubkey> <search_pubkey> [-t threads] [-k]   ║\n", argv[0]);
         printf("║                                                          ║\n");
         printf("║ Operations: +, -, /, x                                   ║\n");
         printf("║ Use Ctrl+C to stop and save progress                     ║\n");
@@ -728,7 +1130,49 @@ int main(int argc, char **argv)
         exit(0);
     }
 
-    if (strcmp(argv[1], "--autosub") == 0)
+    if (strcmp(argv[1], "--spiral") == 0)
+    {
+        if (argc < 4)
+        {
+            printf("For spiral mode: %s --spiral <pubkey> <search_pubkey> [-t threads] [-k]\n", argv[0]);
+            printf("  -t threads : Number of threads to use\n");
+            printf("  -k        : Only generate and save subtractions to 135.txt\n");
+            exit(0);
+        }
+
+        num_threads = 1;
+        bool save_only = false;
+
+        for (int i = 4; i < argc; i++)
+        {
+            if (strcmp(argv[i], "-t") == 0 && i + 1 < argc)
+            {
+                num_threads = atoi(argv[i + 1]);
+                i++;
+                if (num_threads > MAX_THREADS)
+                {
+                    printf("Warning: Thread count exceeds maximum, using %d threads\n", MAX_THREADS);
+                    num_threads = MAX_THREADS;
+                }
+            }
+            else if (strcmp(argv[i], "-k") == 0)
+            {
+                save_only = true;
+            }
+        }
+
+        Point inputPoint;
+        bool isCompressed;
+        if (!secp.ParsePublicKeyHex(argv[2], inputPoint, isCompressed))
+        {
+            printf("Error: Invalid input public key\n");
+            exit(0);
+        }
+
+        spiral_mode(&inputPoint, argv[3], num_threads, save_only);
+        return 0;
+    }
+    else if (strcmp(argv[1], "--autosub") == 0)
     {
         if (argc < 4)
         {
@@ -770,7 +1214,6 @@ int main(int argc, char **argv)
         autosub_mode(&inputPoint, argv[3], num_threads, argc, argv);
         return 0;
     }
-
     else if (strcmp(argv[1], "--reduce") == 0)
     {
         if (argc < 5)
@@ -848,7 +1291,6 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    // Handle standard point operations
     Point point1, point2, result;
     bool isCompressed;
     Int scalar;
@@ -936,3 +1378,4 @@ int main(int argc, char **argv)
 
     return 0;
 }
+
