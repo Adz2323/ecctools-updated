@@ -4,11 +4,13 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <signal.h>
+#include <sys/types.h>
 
 #define MAX_CMD_LENGTH 1024
 
 // Global flag for signal handling
 volatile sig_atomic_t stop_flag = 0;
+pid_t child_pid = -1; // Global to track subprocesses
 
 void signal_handler(int signum)
 {
@@ -16,13 +18,36 @@ void signal_handler(int signum)
     {
         printf("\n[+] Caught interrupt signal, cleaning up...\n");
         stop_flag = 1;
+        if (child_pid > 0)
+        {
+            kill(child_pid, SIGKILL); // Terminate child process
+        }
     }
 }
 
 int run_command(const char *cmd)
 {
-    printf("[+] Executing: %s\n", cmd);
-    return system(cmd);
+    child_pid = fork();
+    if (child_pid == 0)
+    {
+        // Child process
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        perror("[E] Failed to execute command");
+        exit(1);
+    }
+    else if (child_pid > 0)
+    {
+        // Parent process
+        int status;
+        waitpid(child_pid, &status, 0);
+        child_pid = -1; // Reset child_pid after process ends
+        return WEXITSTATUS(status);
+    }
+    else
+    {
+        perror("[E] Fork failed");
+        return 1;
+    }
 }
 
 int main(int argc, char **argv)
@@ -55,7 +80,7 @@ int main(int argc, char **argv)
         if (run_command(div_cmd) != 0)
         {
             printf("[E] Error running keydivision\n");
-            break; // Stop the program on error
+            break;
         }
 
         if (stop_flag)
