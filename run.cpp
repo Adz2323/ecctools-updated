@@ -55,7 +55,7 @@ int main(int argc, char **argv)
         if (run_command(div_cmd) != 0)
         {
             printf("[E] Error running keydivision\n");
-            return 1;
+            break; // Stop the program on error
         }
 
         if (stop_flag)
