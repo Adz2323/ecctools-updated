@@ -3,8 +3,21 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <signal.h>
 
 #define MAX_CMD_LENGTH 1024
+
+// Global flag for signal handling
+volatile sig_atomic_t stop_flag = 0;
+
+void signal_handler(int signum)
+{
+    if (signum == SIGINT)
+    {
+        printf("\n[+] Caught interrupt signal, cleaning up...\n");
+        stop_flag = 1;
+    }
+}
 
 int run_command(const char *cmd)
 {
@@ -20,11 +33,17 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    // Set up signal handling
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
+    sigaction(SIGINT, &sa, NULL);
+
     char div_cmd[MAX_CMD_LENGTH];
     char keyhunt_cmd[MAX_CMD_LENGTH];
     int iteration = 1;
 
-    while (1)
+    while (!stop_flag)
     {
         printf("\n[+] Starting iteration %d\n", iteration);
 
@@ -39,11 +58,17 @@ int main(int argc, char **argv)
             return 1;
         }
 
+        if (stop_flag)
+            break;
+
         // Run keyhunt
         snprintf(keyhunt_cmd, MAX_CMD_LENGTH,
                  "./keyhunt -m xpoint -f 135.txt -r 1:ffffffffff -t 16 -l compress");
 
         int ret = run_command(keyhunt_cmd);
+
+        if (stop_flag)
+            break;
 
         // Check if keyhunt found a match
         FILE *keyhunt_output = fopen("KEYFOUNDKEYFOUND.txt", "r");
@@ -61,6 +86,11 @@ int main(int argc, char **argv)
 
         printf("[+] No match found in iteration %d, continuing...\n", iteration);
         iteration++;
+    }
+
+    if (stop_flag)
+    {
+        printf("[+] Program terminated by user\n");
     }
 
     return 0;
