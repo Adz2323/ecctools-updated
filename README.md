@@ -1,18 +1,6 @@
 # ecctools
 Small collection of tools written in C for ECC and bitcoin
 
-## Why this programs are written in C language?
-Well i like C language because compiled code is faster than interpreted code.
-
-## Warning
-
-- This repository include a small ECDSA Cryptography library.
-- This library was made by myself reading the documentaion but it can have some bugs.
-- I already implement the use of secure memory provided by the gcrypt library.
-- I just solved https://github.com/albertobsd/ecctools/issues/16
-- Use it by your own risk.
-- I use this tools in my  daily basis with my own private key.
-
 ```
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
@@ -25,16 +13,17 @@ SOFTWARE.
 
 ## List of tools in this repository
 
-- [keygen](https://github.com/albertobsd/ecctools#keygen)
-- [sharedsecret](https://github.com/albertobsd/ecctools#sharedsecret)
-- [rehashaddress](https://github.com/albertobsd/ecctools#rehashaddress)
-- [calculatefromkey](https://github.com/albertobsd/ecctools#calculatefromkey)
-- [calculatefrompublickey](https://github.com/albertobsd/ecctools#calculatefrompublickey)
-- [keydivision](https://github.com/albertobsd/ecctools#keydivision)
-- [keymath](https://github.com/albertobsd/ecctools#keymath)
-- [modmath](https://github.com/albertobsd/ecctools#modmath)
-- [addr2rmd](https://github.com/albertobsd/ecctools#addr2rmd)
-- [verifymsg](https://github.com/albertobsd/ecctools#verifymsg)
+- [keygen](https://github.com/Adz2323/ecctools-updated#keygen)
+- [sharedsecret](https://github.com/Adz2323/ecctools-updated#sharedsecret)
+- [rehashaddress](https://github.com/Adz2323/ecctools-updated#rehashaddress)
+- [calculatefromkey](https://github.com/Adz2323/ecctools-updated#calculatefromkey)
+- [calculatefrompublickey](https://github.com/Adz2323/ecctools-updated#calculatefrompublickey)
+- [keydivision](https://github.com/Adz2323/ecctools-updated#keydivision)
+- [keymath](https://github.com/Adz2323/ecctools-updated#keymath)
+- [modmath](https://github.com/Adz2323/ecctools-updated#modmath)
+- [addr2rmd](https://github.com/Adz2323/ecctools-updated#addr2rmd)
+- [verifymsg](https://github.com/Adz2323/ecctools-updated#verifymsg)
+- [keyhunt](https://github.com/Adz2323/ecctools-updated#keyhunt)
 
 ## How to download and run the code?
 
@@ -54,7 +43,7 @@ apt install libgmp-dev
 Clone this repository
 
 ```
-git clone https://github.com/albertobsd/ecctools.git
+git clone https://github.com/Adz2323/ecctools-updated.git
 ```
 
 Compile:
@@ -366,13 +355,11 @@ HCsBcgB+Wcm8kOGMH8IpNeg0H4gjCrlqwDf/GlSXphZGBYxm0QkKEPhh9DTJRp2IDNUhVr0FhP9qCqo2
 -----END BITCOIN SIGNATURE-----
 ```
 
-## Do you wanna more programs here?
+## RUN?
 
-Well just ask for the program that you want. But please don't be annoying, I do this for hobby and fun.
+This programme runs using ./run currently set to run Spiral mode on keydivision.c and then xPoint mode on keyhunt until it finds a match
 
-Use the Issue section or the bitcointalk topic:
 
-https://github.com/albertobsd/ecctools/issues
 
 https://bitcointalk.org/index.php?topic=5361234.0
 
