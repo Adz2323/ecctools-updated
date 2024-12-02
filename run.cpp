@@ -72,9 +72,9 @@ int main(int argc, char **argv)
     {
         printf("\n[+] Starting iteration %d\n", iteration);
 
-        // Run keydivision with -k option
+        // Run keydivision with spiral mode and -k option
         snprintf(div_cmd, MAX_CMD_LENGTH,
-                 "./div --autosub %s %s -t 16 -k",
+                 "./div --spiral %s %s -t 16 -k",
                  argv[1], argv[2]);
 
         if (run_command(div_cmd) != 0)
@@ -86,9 +86,9 @@ int main(int argc, char **argv)
         if (stop_flag)
             break;
 
-        // Run keyhunt
+        // Run keyhunt - unchanged as it still uses the same 135.txt file
         snprintf(keyhunt_cmd, MAX_CMD_LENGTH,
-                 "./keyhunt -m xpoint -f 135.txt -r 1:ffffffffff -t 16 -l compress");
+                 "./keyhunt -m xpoint -f 135.txt -r 1:3fffffff -t 16 -l compress");
 
         int ret = run_command(keyhunt_cmd);
 
@@ -110,12 +110,16 @@ int main(int argc, char **argv)
         }
 
         printf("[+] No match found in iteration %d, continuing...\n", iteration);
+        // Remove the binary subtraction store file after each iteration
+        remove("spiral_subtractions.bin");
         iteration++;
     }
 
     if (stop_flag)
     {
         printf("[+] Program terminated by user\n");
+        // Clean up the binary subtraction store if interrupted
+        remove("spiral_subtractions.bin");
     }
 
     return 0;
