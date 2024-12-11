@@ -16,7 +16,7 @@ email: albertobsd@gmail.com
 #include "oldbloom/oldbloom.h"
 #include "bloom/bloom.h"
 #include "sha3/sha3.h"
-#include "util.h"
+#include "util/util.h"
 
 #include "secp256k1/SECP256k1.h"
 #include "secp256k1/Point.h"
