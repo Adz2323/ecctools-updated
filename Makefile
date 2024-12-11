@@ -19,7 +19,7 @@ default:
 	g++ -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Wno-deprecated-copy -Ofast -o hash/ripemd160_sse.o -ftree-vectorize -flto -c hash/ripemd160_sse.cpp
 	g++ -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Wno-deprecated-copy -Ofast -o hash/sha256_sse.o -ftree-vectorize -flto -c hash/sha256_sse.cpp
 	g++ -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Wno-deprecated-copy -Ofast -ftree-vectorize -flto -std=c++11 -I/usr/local/include -c keydivision.c -o div.o
-	gcc -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Wno-deprecated-copy -Ofast -ftree-vectorize -o Auto AutoDivison.c gmpecc.c util.o bloom.o base58.o sha256.o rmd160.o xxhash.o -lgmp -pthread
+	gcc -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Wno-deprecated-copy -Ofast -ftree-vectorize -o Auto AutoDivisoin.c gmpecc.c util.o bloom.o base58.o sha256.o rmd160.o xxhash.o -lgmp -pthread
 	g++ -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Wno-deprecated-copy -Ofast -ftree-vectorize -o keyhunt keyhunt.cpp base58.o rmd160.o hash/ripemd160.o hash/ripemd160_sse.o hash/sha256.o hash/sha256_sse.o bloom.o oldbloom.o xxhash.o util.o Int.o Point.o SECP256K1.o IntMod.o Random.o IntGroup.o sha3.o keccak.o -lm -lpthread
 	g++ -m64 -march=native -mtune=native -mssse3 -pthread -Ofast -flto \
 		bloom.o base58.o rmd160.o sha3.o keccak.o xxhash.o util.o \
