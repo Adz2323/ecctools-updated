@@ -212,16 +212,19 @@ void save_path_to_file(const char *path, const char *found_pk, bool is_match)
     pthread_mutex_unlock(&file_mutex);
 }
 
-void print_status(const char *pubkey, int divisions, int target_bit, bool must_divide, unsigned long long thread_attempts)
+void print_status(const char *pubkey, int divisions, int subtractions, int target_bit, bool must_divide, unsigned long long thread_attempts, int division_probability)
 {
     pthread_mutex_lock(&print_mutex);
     printf("\r\033[2K");
-    printf("Total Attempts: %llu | Progress: %d/%d | Operation: %-8s | Key: %s",
+    printf("Total Attempts: %llu | DIV: %.1f%% SUB: %.1f%% | Progress: %d/%d | Operation: %-8s | Key: %s | Div Prob: %d%%",
            thread_attempts,
+           (divisions * 100.0) / (divisions + subtractions),
+           (subtractions * 100.0) / (divisions + subtractions),
            divisions,
            target_bit,
            must_divide ? "MUST DIV" : (rand() % 2 == 1 ? "DIV" : "SUB"),
-           pubkey);
+           pubkey,
+           division_probability);
     fflush(stdout);
     pthread_mutex_unlock(&print_mutex);
 }
@@ -234,41 +237,67 @@ void *find_division_path_thread(void *arg)
     mpz_init(current_point.y);
     unsigned long long thread_attempts = 0;
 
+    // Dynamic ratio control
+    int division_probability = 50; // Start at 50%
+    bool increasing = true;
+    const int MIN_DIV_PROB = 50;
+    const int MAX_DIV_PROB = 90;
+    const int RATIO_CHANGE_INTERVAL = 1000;
+    const int RATIO_CHANGE_STEP = 1;
+
     while (1)
     {
         char current_pk[132];
         char path[10000] = "";
         int divisions = 0;
+        int subtractions = 0;
         bool must_divide = false;
 
         mpz_set(current_point.x, args->start_pubkey.x);
         mpz_set(current_point.y, args->start_pubkey.y);
 
-        mpz_t two, one, inversemultiplier;
+        mpz_t two, one;
         mpz_init_set_str(two, "2", 10);
         mpz_init_set_str(one, "1", 10);
+        mpz_t inversemultiplier;
         mpz_init(inversemultiplier);
 
-        unsigned int seed;
-        char seed_str[65];
+        unsigned int seed = time(NULL) ^ (thread_attempts * 1099511628211ULL) ^ args->thread_id;
+        srand(seed);
         thread_attempts++;
 
         pthread_mutex_lock(&attempts_mutex);
         total_attempts++;
+        if (total_attempts % RATIO_CHANGE_INTERVAL == 0)
+        {
+            if (increasing)
+            {
+                division_probability += RATIO_CHANGE_STEP;
+                if (division_probability >= MAX_DIV_PROB)
+                {
+                    increasing = false;
+                }
+            }
+            else
+            {
+                division_probability -= RATIO_CHANGE_STEP;
+                if (division_probability <= MIN_DIV_PROB)
+                {
+                    increasing = true;
+                }
+            }
+        }
         pthread_mutex_unlock(&attempts_mutex);
 
-        gmp_snprintf(seed_str, 65, "%Zx%d%d", current_point.x, thread_attempts, args->thread_id);
-        seed = time(NULL) ^ (thread_attempts * 1099511628211ULL) ^ args->thread_id;
-        srand(seed);
+        int max_subtractions = (int)(args->target_bit * (1.0 - (division_probability / 100.0)));
 
         while (divisions < args->target_bit)
         {
             generate_strpublickey(&current_point, true, current_pk);
 
-            // Only thread 0 prints status
             if (args->thread_id == 0)
             {
-                print_status(current_pk, divisions, args->target_bit, must_divide, total_attempts);
+                print_status(current_pk, divisions, subtractions, args->target_bit, must_divide, total_attempts, division_probability);
             }
 
             if (bloom_initialized1 && triple_bloom_check(current_pk))
@@ -277,6 +306,7 @@ void *find_division_path_thread(void *arg)
                 printf("\nPotential match found by thread %d!\n", args->thread_id);
                 printf("Public Key: %s\n", current_pk);
                 printf("Verification Path: %s\n", path);
+                printf("Current division probability: %d%%\n", division_probability);
                 pthread_mutex_unlock(&print_mutex);
 
                 pthread_mutex_lock(&file_mutex);
@@ -288,9 +318,9 @@ void *find_division_path_thread(void *arg)
                     fprintf(file, "\n=== Match Found at %s", ctime(&now));
                     fprintf(file, "Initial Public Key: %s\n", args->initial_pk);
                     fprintf(file, "Found Public Key: %s\n", current_pk);
+                    fprintf(file, "Division Probability: %d%%\n", division_probability);
                     fprintf(file, "By Thread: %d\n", args->thread_id);
                     fprintf(file, "At Attempt: %llu\n", thread_attempts);
-                    fprintf(file, "After %d divisions\n", divisions);
                     fprintf(file, "Complete Path: %s\n", path);
                     fprintf(file, "=====================================\n");
                     fclose(file);
@@ -298,7 +328,8 @@ void *find_division_path_thread(void *arg)
                 pthread_mutex_unlock(&file_mutex);
             }
 
-            if (must_divide || (rand() % 2 == 1))
+            double current_div_ratio = divisions > 0 ? (divisions * 100.0) / (divisions + subtractions) : 0;
+            if (must_divide || subtractions >= max_subtractions || current_div_ratio < division_probability)
             {
                 struct Point temp_point;
                 mpz_init(temp_point.x);
@@ -317,7 +348,7 @@ void *find_division_path_thread(void *arg)
                 mpz_clear(temp_point.x);
                 mpz_clear(temp_point.y);
             }
-            else
+            else if (subtractions < max_subtractions)
             {
                 struct Point G_point, temp_point;
                 mpz_init_set(G_point.x, G.x);
@@ -332,15 +363,14 @@ void *find_division_path_thread(void *arg)
                 mpz_init_set(point_to_subtract.y, temp_point.y);
 
                 Point_Negation(&point_to_subtract, &temp_point);
-
                 mpz_set(point_to_subtract.x, temp_point.x);
                 mpz_set(point_to_subtract.y, temp_point.y);
 
                 Point_Addition(&current_point, &point_to_subtract, &temp_point);
-
                 mpz_set(current_point.x, temp_point.x);
                 mpz_set(current_point.y, temp_point.y);
 
+                subtractions++;
                 strcat(path, "-1,");
                 must_divide = true;
 
@@ -351,11 +381,26 @@ void *find_division_path_thread(void *arg)
                 mpz_clear(point_to_subtract.x);
                 mpz_clear(point_to_subtract.y);
             }
+            else
+            {
+                must_divide = true;
+                continue;
+            }
+
+            if (Point_is_zero(&current_point))
+            {
+                break;
+            }
         }
 
         mpz_clear(two);
         mpz_clear(one);
         mpz_clear(inversemultiplier);
+
+        if (divisions >= args->target_bit)
+        {
+            save_path_to_file(path, current_pk, false);
+        }
     }
 
     mpz_clear(current_point.x);
