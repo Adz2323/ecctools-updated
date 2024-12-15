@@ -36,12 +36,12 @@ const char *VERSION = "1.0.0";
 #define THREAD_SLEEP_MICROSECONDS 100
 
 // Bloom filter configuration
-#define MAX_ENTRIES1 100000000
-#define MAX_ENTRIES2 80000000
-#define MAX_ENTRIES3 60000000
-#define FP_RATE1 0.001
-#define FP_RATE2 0.0001
-#define FP_RATE3 0.00001
+#define MAX_ENTRIES1 1000000000
+#define MAX_ENTRIES2 800000000
+#define MAX_ENTRIES3 600000000
+#define FP_RATE1 0.0001
+#define FP_RATE2 0.00001
+#define FP_RATE3 0.000001
 
 bool debug_mode = false;
 
