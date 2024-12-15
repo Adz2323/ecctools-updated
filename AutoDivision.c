@@ -286,18 +286,15 @@ void update_division_control(struct DivisionControl *ctrl, bool path_successful)
 {
     pthread_mutex_lock(&ctrl->mutex);
 
-    if (path_successful)
-    {
+    if (path_successful) {
         ctrl->consecutive_failures = 0;
         ctrl->success_count++;
         ctrl->completed_paths_at_current_level++;
 
-        if (ctrl->completed_paths_at_current_level >= PATHS_PER_SUBTRACTION_LEVEL)
-        {
-            if (ctrl->current_subtractions == MAX_SUBTRACTIONS)
-            {
+        if (ctrl->completed_paths_at_current_level >= PATHS_PER_SUBTRACTION_LEVEL) {
+            if (ctrl->current_subtractions == MAX_SUBTRACTIONS) {
                 pthread_mutex_lock(&print_mutex);
-                printf("\rResetting from %d back to %d subtractions\n",
+                printf("\rResetting from %d back to %d subtractions        ", 
                        ctrl->current_subtractions, MIN_SUBTRACTIONS);
                 fflush(stdout);
                 pthread_mutex_unlock(&print_mutex);
@@ -305,11 +302,10 @@ void update_division_control(struct DivisionControl *ctrl, bool path_successful)
                 ctrl->current_subtractions = MIN_SUBTRACTIONS;
                 ctrl->completed_paths_at_current_level = 0;
             }
-            else
-            {
+            else {
                 ctrl->current_subtractions++;
                 pthread_mutex_lock(&print_mutex);
-                printf("\rAdvancing to subtraction level: %d\n",
+                printf("\rAdvancing to subtraction level: %d        ", 
                        ctrl->current_subtractions);
                 fflush(stdout);
                 pthread_mutex_unlock(&print_mutex);
@@ -317,9 +313,13 @@ void update_division_control(struct DivisionControl *ctrl, bool path_successful)
             }
         }
     }
-    else
-    {
+    else {
         ctrl->consecutive_failures++;
+        
+        // Optional: Add failure handling logic here if needed
+        if (ctrl->consecutive_failures > 1000000) { // Example threshold
+            ctrl->consecutive_failures = 0;
+        }
     }
 
     pthread_mutex_unlock(&ctrl->mutex);
