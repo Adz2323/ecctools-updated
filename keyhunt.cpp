@@ -145,6 +145,9 @@ void init_generator();
 int searchbinary(struct address_value *buffer, char *data, int64_t array_length);
 void sleep_ms(int milliseconds);
 
+void write_pubkey_binary(unsigned char *pubkey_bytes);
+void convert_bin_to_txt(const char *bin_file, const char *txt_file);
+
 void _sort(struct address_value *arr, int64_t N);
 void _insertionsort(struct address_value *arr, int64_t n);
 void _introsort(struct address_value *arr, uint32_t depthLimit, int64_t n);
@@ -317,8 +320,10 @@ int FLAGPRECALCUTED_P_FILE = 0;
 // publickey Print
 int FLAGPRINTPUBKEYS = 0;
 FILE *pubkeyfile = NULL;
+FILE *pubkeyfile_bin = NULL;
 uint64_t max_pubkeys_to_generate = 0;
 uint64_t pubkeys_generated = 0;
+const char *pubkeyfile_name = "scanned_pubkeys.bin";
 
 int bitrange;
 char *str_N;
@@ -688,14 +693,16 @@ int main(int argc, char **argv)
         case 'p':
             FLAGPRINTPUBKEYS = 1;
             max_pubkeys_to_generate = strtoull(optarg, NULL, 10);
-            pubkeyfile = fopen("scanned_pubkeys.txt", "w");
+            pubkeyfile = fopen("scanned_pubkeys.bin", "wb"); // Changed to .bin and "wb" for binary write
             if (pubkeyfile == NULL)
             {
                 fprintf(stderr, "[E] Unable to open file for writing scanned public keys\n");
                 exit(EXIT_FAILURE);
             }
-            printf("[+] Scanned compressed public keys will be saved to scanned_pubkeys.txt\n");
+            printf("[+] Scanned compressed public keys will be saved to scanned_pubkeys.bin\n");
             printf("[+] Will stop after generating %llu public keys\n", max_pubkeys_to_generate);
+            printf("[+] Each key uses 33 bytes (1 byte prefix + 32 bytes X coordinate)\n");
+            printf("[+] Estimated file size: %.2f GB\n", (double)(max_pubkeys_to_generate * 33) / (1024.0 * 1024.0 * 1024.0));
             break;
         case 'q':
             FLAGQUIET = 1;
@@ -3382,8 +3389,13 @@ void *thread_process(void *vargp)
                                     privateKey.Add(&key_mpz);
 
                                     Point publicKey = secp->ComputePublicKey(&privateKey);
-                                    char pubKeyHex[67];
-                                    secp->GetPublicKeyHex(true, publicKey, pubKeyHex);
+
+                                    // Create 33-byte binary public key
+                                    unsigned char binPubKey[33];
+                                    // Set first byte based on Y coordinate (0x02 for even, 0x03 for odd)
+                                    binPubKey[0] = publicKey.y.IsEven() ? 0x02 : 0x03;
+                                    // Get the 32 bytes of X coordinate
+                                    publicKey.x.Get32Bytes(binPubKey + 1);
 
 #if defined(_WIN64) && !defined(__CYGWIN__)
                                     WaitForSingleObject(write_keys, INFINITE);
@@ -3391,7 +3403,8 @@ void *thread_process(void *vargp)
                                     pthread_mutex_lock(&write_keys);
 #endif
 
-                                    fprintf(pubkeyfile, "%s\n", pubKeyHex);
+                                    // Write the 33 bytes directly to file
+                                    fwrite(binPubKey, 1, 33, pubkeyfile);
                                     pubkeys_generated++;
 
                                     if (pubkeys_generated >= max_pubkeys_to_generate)
@@ -3497,8 +3510,13 @@ void *thread_process(void *vargp)
                                     privateKey.Add(&key_mpz);
 
                                     Point publicKey = secp->ComputePublicKey(&privateKey);
-                                    char pubKeyHex[67];
-                                    secp->GetPublicKeyHex(true, publicKey, pubKeyHex);
+
+                                    // Create 33-byte binary public key
+                                    unsigned char binPubKey[33];
+                                    // Set first byte based on Y coordinate (0x02 for even, 0x03 for odd)
+                                    binPubKey[0] = publicKey.y.IsEven() ? 0x02 : 0x03;
+                                    // Get the 32 bytes of X coordinate
+                                    publicKey.x.Get32Bytes(binPubKey + 1);
 
 #if defined(_WIN64) && !defined(__CYGWIN__)
                                     WaitForSingleObject(write_keys, INFINITE);
@@ -3506,7 +3524,8 @@ void *thread_process(void *vargp)
                                     pthread_mutex_lock(&write_keys);
 #endif
 
-                                    fprintf(pubkeyfile, "%s\n", pubKeyHex);
+                                    // Write the 33 bytes directly to file
+                                    fwrite(binPubKey, 1, 33, pubkeyfile);
                                     pubkeys_generated++;
 
                                     if (pubkeys_generated >= max_pubkeys_to_generate)
@@ -6871,6 +6890,39 @@ bool vanityrmdmatch(unsigned char *rmdhash)
     return r;
 }
 
+// Utility function to convert binary pubkeys back to readable format
+void convert_bin_to_txt(const char *bin_file, const char *txt_file)
+{
+    FILE *bin = fopen(bin_file, "rb");
+    FILE *txt = fopen(txt_file, "w");
+
+    if (!bin || !txt)
+    {
+        printf("Error opening files for conversion\n");
+        return;
+    }
+
+    unsigned char pubkey[33];
+    char hex_pubkey[67];
+
+    while (fread(pubkey, 1, 33, bin) == 33)
+    {
+        // Convert first byte to hex
+        sprintf(hex_pubkey, "%02x", pubkey[0]);
+
+        // Convert remaining 32 bytes to hex
+        for (int i = 1; i < 33; i++)
+        {
+            sprintf(hex_pubkey + (i * 2), "%02x", pubkey[i]);
+        }
+
+        fprintf(txt, "%s\n", hex_pubkey);
+    }
+
+    fclose(bin);
+    fclose(txt);
+}
+
 void writevanitykey(bool compressed, Int *key)
 {
     Point publickey;
@@ -7076,6 +7128,22 @@ void checkpointer(void *ptr, const char *file, const char *function, const char 
     {
         fprintf(stderr, "[E] error in file %s, %s pointer %s on line %i\n", file, function, name, line);
         exit(EXIT_FAILURE);
+    }
+}
+
+void write_pubkey_binary(unsigned char *pubkey_bytes)
+{
+    if (pubkeyfile_bin != NULL)
+    {
+        fwrite(pubkey_bytes, 1, 33, pubkeyfile_bin);
+        pubkeys_generated++;
+
+        if (pubkeys_generated >= max_pubkeys_to_generate)
+        {
+            printf("\n[+] Generated %llu public keys. Stopping as requested.\n", pubkeys_generated);
+            fclose(pubkeyfile_bin);
+            exit(EXIT_SUCCESS);
+        }
     }
 }
 
