@@ -10,12 +10,13 @@ Auto:
 		-c rmd160/rmd160.c -o Auto_rmd160.o
 	gcc -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Ofast -ftree-vectorize \
 		-c xxhash/xxhash.c -o Auto_xxhash.o
+	g++ -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Wno-deprecated-copy -Ofast -ftree-vectorize -flto -c Random.cpp -o Random.o
 	gcc -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Ofast -ftree-vectorize \
 		-c gmpecc.c -o Auto_gmpecc.o
 	gcc -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Ofast -ftree-vectorize \
 		-c util.c -o Auto_util.o
 	gcc -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Ofast -ftree-vectorize \
-		-o Auto AutoDivision.c Auto_bloom.o Auto_sha256.o Auto_base58.o Auto_rmd160.o Auto_xxhash.o Auto_gmpecc.o Auto_util.o -lgmp -pthread
+		-o Auto AutoDivision.c Auto_bloom.o Auto_sha256.o Auto_base58.o Random.o Auto_rmd160.o Auto_xxhash.o Auto_gmpecc.o Auto_util.o -lgmp -pthread
 
 # Target for KeyDivision
 keydivision:
