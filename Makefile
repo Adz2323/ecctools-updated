@@ -16,7 +16,7 @@ Auto:
 	gcc -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Ofast -ftree-vectorize \
 		-c util.c -o Auto_util.o
 	gcc -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Ofast -ftree-vectorize \
-		-o Auto AutoDivision.c Auto_bloom.o Auto_sha256.o Auto_base58.o Random.o Auto_rmd160.o Auto_xxhash.o Auto_gmpecc.o Auto_util.o -lgmp -pthread
+		-o Auto AutoDivision.c Auto_bloom.o Auto_sha256.o Auto_base58.o Random.o Auto_rmd160.o Auto_xxhash.o Auto_gmpecc.o Auto_util.o -lgmp -pthread -lm
 
 # Target for KeyDivision
 keydivision:
