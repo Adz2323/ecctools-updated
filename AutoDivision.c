@@ -16,6 +16,11 @@
 #include "sha256/sha256.h"
 #include "xxhash/xxhash.h"
 #include "Random.h"
+#include <inttypes.h> // For PRIu64
+#include <math.h>     // For log function
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 // Version
 const char *VERSION = "1.0.0";
@@ -27,21 +32,33 @@ const char *VERSION = "1.0.0";
 #define TARGET_MAX_DIVISIONS 134
 #define MIN_SUBTRACTIONS 40
 #define MAX_SUBTRACTIONS 97
-#define PATHS_PER_SUBTRACTION_LEVEL 1000
-#define MAX_TIME_AT_LEVEL 300    // 5 minutes in seconds
-#define PATH_CHECK_INTERVAL 1000 // Check every 1000 attempts
+#define PATHS_PER_SUBTRACTION_LEVEL 100000
+#define MAX_TIME_AT_LEVEL 900     // 5 minutes in seconds
+#define PATH_CHECK_INTERVAL 1000  // Check every 1000 attempts
+#define COMPRESSED_PUBKEY_SIZE 33 // Size of binary compressed pubkey
+#define HEX_PUBKEY_SIZE 66        // Size of hex string pubkey without null terminator
 
 // Thread management
 #define MAX_THREADS 256
 #define THREAD_SLEEP_MICROSECONDS 100
 
 // Bloom filter configuration
-#define MAX_ENTRIES1 1000000000
-#define MAX_ENTRIES2 800000000
-#define MAX_ENTRIES3 600000000
-#define FP_RATE1 0.0001
-#define FP_RATE2 0.00001
-#define FP_RATE3 0.000001
+#define MAX_ENTRIES1 10000000000
+#define MAX_ENTRIES2 8000000000
+#define MAX_ENTRIES3 6000000000
+#define PUBKEY_PREFIX_LENGTH 6
+#define BLOOM1_FP_RATE 0.00001
+#define BLOOM2_FP_RATE 0.000001
+#define BLOOM3_FP_RATE 0.0000001
+#define BUFFER_SIZE (1024 * 1024) // 1MB buffer
+#define WORKER_BATCH_SIZE 10000   // Number of entries per worker batch
+
+// Structure for storing compressed pubkeys
+struct CompressedPubKey
+{
+    uint8_t prefix[PUBKEY_PREFIX_LENGTH];
+    char type;
+};
 
 bool debug_mode = false;
 
@@ -57,6 +74,15 @@ struct PerformanceMetrics
     time_t start_time;
     time_t last_success_time; // New field
     pthread_mutex_t metrics_mutex;
+};
+
+// Structure to hold file info
+struct FileInfo
+{
+    FILE *file;
+    bool is_binary;
+    size_t total_entries;
+    pthread_mutex_t file_mutex;
 };
 
 // Division control structure
@@ -82,15 +108,27 @@ struct thread_args
     struct PerformanceMetrics *metrics;
 };
 
+struct bloom_load_worker
+{
+    struct bloom *bloom1;
+    struct bloom *bloom2;
+    struct bloom *bloom3;
+    unsigned char *entries;
+    size_t num_entries;
+    bool is_binary;
+};
+
 // Global variables
 struct Elliptic_Curve EC;
 struct Point G;
 struct Point DoublingG[256];
+struct FileInfo search_file_info = {NULL, false, 0, PTHREAD_MUTEX_INITIALIZER};
 
 const char *EC_constant_N = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141";
 const char *EC_constant_P = "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f";
 const char *EC_constant_Gx = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 const char *EC_constant_Gy = "483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8";
+char current_path[10000] = ""; // To store current path for logging
 
 // Bloom filter globals
 struct bloom bloom_filter1;
@@ -118,6 +156,7 @@ bool should_divide(struct DivisionControl *ctrl, int current_divisions,
 void update_division_control(struct DivisionControl *ctrl, bool path_successful);
 void *find_division_path_thread(void *arg);
 int init_multi_bloom_from_file(const char *filename);
+void *bloom_load_worker_thread(void *arg);
 void cleanup_bloom_filters(void);
 bool triple_bloom_check(const char *pubkey);
 void generate_strpublickey(struct Point *publickey, bool compress, char *dst);
@@ -127,6 +166,211 @@ bool Point_is_zero(struct Point *P);
 void Scalar_Multiplication_custom(struct Point P, struct Point *R, mpz_t m);
 void save_debug_info(const char *path, const char *pubkey, int divisions, int subtractions,
                      char **intermediate_pubkeys, int step_count);
+uint64_t estimate_bloom_size(uint64_t items, double fp_rate);
+void print_memory_requirements(void);
+bool is_binary_file(const char *filename);
+int read_pubkey_at_position(size_t pos, char *pubkey_hex);
+int64_t binary_search_pubkey(const char *target_pubkey);
+int init_search_file(const char *filename);
+
+void *bloom_load_worker_thread(void *arg)
+{
+    struct bloom_load_worker *worker = (struct bloom_load_worker *)arg;
+    char pubkey_hex[67];
+
+    for (size_t i = 0; i < worker->num_entries; i++)
+    {
+        if (worker->is_binary)
+        {
+            // Convert binary pubkey to hex
+            const unsigned char *pubkey_data = worker->entries + (i * COMPRESSED_PUBKEY_SIZE);
+            for (int j = 0; j < COMPRESSED_PUBKEY_SIZE; j++)
+            {
+                snprintf(pubkey_hex + (j * 2), 3, "%02x", pubkey_data[j]);
+            }
+            pubkey_hex[66] = '\0';
+        }
+        else
+        {
+            // Copy hex pubkey directly
+            memcpy(pubkey_hex, worker->entries + (i * HEX_PUBKEY_SIZE), 66);
+            pubkey_hex[66] = '\0';
+        }
+
+        // Add to bloom filters
+        bloom_add(worker->bloom1, pubkey_hex, PUBKEY_PREFIX_LENGTH);
+        XXH64_hash_t hash = XXH64(pubkey_hex, 66, 0x1234);
+        bloom_add(worker->bloom2, (char *)&hash, sizeof(hash));
+        hash = XXH64(pubkey_hex, 66, 0x5678);
+        bloom_add(worker->bloom3, (char *)&hash, sizeof(hash));
+    }
+
+    return NULL;
+}
+
+int read_pubkey_at_position(size_t pos, char *pubkey_hex)
+{
+    pthread_mutex_lock(&search_file_info.file_mutex);
+
+    if (search_file_info.is_binary)
+    {
+        unsigned char pubkey_data[COMPRESSED_PUBKEY_SIZE];
+
+        // Seek to position
+        if (fseek(search_file_info.file, pos * COMPRESSED_PUBKEY_SIZE, SEEK_SET) != 0)
+        {
+            pthread_mutex_unlock(&search_file_info.file_mutex);
+            return 0;
+        }
+
+        // Read binary pubkey
+        size_t read_bytes = fread(pubkey_data, 1, COMPRESSED_PUBKEY_SIZE, search_file_info.file);
+        if (read_bytes != COMPRESSED_PUBKEY_SIZE)
+        {
+            pthread_mutex_unlock(&search_file_info.file_mutex);
+            return 0;
+        }
+
+        // Convert to hex
+        for (int i = 0; i < COMPRESSED_PUBKEY_SIZE; i++)
+        {
+            snprintf(pubkey_hex + (i * 2), 3, "%02x", pubkey_data[i]);
+        }
+        pubkey_hex[66] = '\0'; // Ensure null termination
+    }
+    else
+    {
+        // Text file handling
+        if (fseek(search_file_info.file, 0, SEEK_SET) != 0)
+        {
+            pthread_mutex_unlock(&search_file_info.file_mutex);
+            return 0;
+        }
+
+        char line[132];
+        size_t current_pos = 0;
+
+        // Skip to desired position
+        while (current_pos < pos)
+        {
+            if (!fgets(line, sizeof(line), search_file_info.file))
+            {
+                pthread_mutex_unlock(&search_file_info.file_mutex);
+                return 0;
+            }
+            current_pos++;
+        }
+
+        // Read target line
+        if (!fgets(line, sizeof(line), search_file_info.file))
+        {
+            pthread_mutex_unlock(&search_file_info.file_mutex);
+            return 0;
+        }
+
+        // Remove newline and copy
+        line[strcspn(line, "\n")] = 0;
+        strncpy(pubkey_hex, line, 66);
+        pubkey_hex[66] = '\0';
+    }
+
+    pthread_mutex_unlock(&search_file_info.file_mutex);
+    return 1;
+}
+
+// Binary search for pubkey
+int64_t binary_search_pubkey(const char *target_pubkey)
+{
+    int64_t left = 0;
+    int64_t right = search_file_info.total_entries - 1;
+    char current_pubkey[HEX_PUBKEY_SIZE + 1];
+
+    while (left <= right)
+    {
+        int64_t mid = left + (right - left) / 2;
+
+        if (!read_pubkey_at_position(mid, current_pubkey))
+        {
+            return -1; // Read error
+        }
+
+        int cmp = strncmp(current_pubkey, target_pubkey, HEX_PUBKEY_SIZE);
+
+        if (cmp == 0)
+        {
+            return mid; // Found exact match
+        }
+
+        if (cmp < 0)
+        {
+            left = mid + 1;
+        }
+        else
+        {
+            right = mid - 1;
+        }
+    }
+
+    return -1; // Not found
+}
+
+int init_search_file(const char *filename)
+{
+    search_file_info.file = fopen(filename, "rb");
+    if (!search_file_info.file)
+    {
+        printf("Error: Cannot open search file %s\n", filename);
+        return 0;
+    }
+
+    // Determine if binary and calculate total entries
+    search_file_info.is_binary = is_binary_file(filename);
+
+    // Get file size
+    fseek(search_file_info.file, 0, SEEK_END);
+    long file_size = ftell(search_file_info.file);
+    fseek(search_file_info.file, 0, SEEK_SET);
+
+    if (search_file_info.is_binary)
+    {
+        search_file_info.total_entries = file_size / COMPRESSED_PUBKEY_SIZE;
+        printf("Binary file with %zu compressed pubkeys\n", search_file_info.total_entries);
+    }
+    else
+    {
+        // For text file, count lines
+        char line[132];
+        size_t count = 0;
+        while (fgets(line, sizeof(line), search_file_info.file))
+        {
+            count++;
+        }
+        search_file_info.total_entries = count;
+        fseek(search_file_info.file, 0, SEEK_SET);
+        printf("Text file with %zu pubkeys\n", search_file_info.total_entries);
+    }
+
+    return 1;
+}
+
+bool is_binary_file(const char *filename)
+{
+    FILE *file = fopen(filename, "rb");
+    if (!file)
+        return false;
+
+    unsigned char buf[4];
+    size_t read = fread(buf, 1, 4, file);
+    fclose(file);
+
+    // Check if first byte is 02 or 03 (compressed pubkey prefix)
+    if (read >= 1 && (buf[0] == 0x02 || buf[0] == 0x03))
+    {
+        return true;
+    }
+
+    return false;
+}
 
 void save_debug_info(const char *path, const char *pubkey, int divisions, int subtractions,
                      char **intermediate_pubkeys, int step_count)
@@ -286,15 +530,18 @@ void update_division_control(struct DivisionControl *ctrl, bool path_successful)
 {
     pthread_mutex_lock(&ctrl->mutex);
 
-    if (path_successful) {
+    if (path_successful)
+    {
         ctrl->consecutive_failures = 0;
         ctrl->success_count++;
         ctrl->completed_paths_at_current_level++;
 
-        if (ctrl->completed_paths_at_current_level >= PATHS_PER_SUBTRACTION_LEVEL) {
-            if (ctrl->current_subtractions == MAX_SUBTRACTIONS) {
+        if (ctrl->completed_paths_at_current_level >= PATHS_PER_SUBTRACTION_LEVEL)
+        {
+            if (ctrl->current_subtractions == MAX_SUBTRACTIONS)
+            {
                 pthread_mutex_lock(&print_mutex);
-                printf("\rResetting from %d back to %d subtractions        ", 
+                printf("\rResetting from %d back to %d subtractions        ",
                        ctrl->current_subtractions, MIN_SUBTRACTIONS);
                 fflush(stdout);
                 pthread_mutex_unlock(&print_mutex);
@@ -302,10 +549,11 @@ void update_division_control(struct DivisionControl *ctrl, bool path_successful)
                 ctrl->current_subtractions = MIN_SUBTRACTIONS;
                 ctrl->completed_paths_at_current_level = 0;
             }
-            else {
+            else
+            {
                 ctrl->current_subtractions++;
                 pthread_mutex_lock(&print_mutex);
-                printf("\rAdvancing to subtraction level: %d        ", 
+                printf("\rAdvancing to subtraction level: %d        ",
                        ctrl->current_subtractions);
                 fflush(stdout);
                 pthread_mutex_unlock(&print_mutex);
@@ -313,11 +561,13 @@ void update_division_control(struct DivisionControl *ctrl, bool path_successful)
             }
         }
     }
-    else {
+    else
+    {
         ctrl->consecutive_failures++;
-        
+
         // Optional: Add failure handling logic here if needed
-        if (ctrl->consecutive_failures > 1000000) { // Example threshold
+        if (ctrl->consecutive_failures > 1000000)
+        { // Example threshold
             ctrl->consecutive_failures = 0;
         }
     }
@@ -396,7 +646,6 @@ void *find_division_path_thread(void *arg)
         if (args->div_ctrl->current_subtractions == MAX_SUBTRACTIONS &&
             current_time - args->metrics->last_success_time > MAX_TIME_AT_LEVEL)
         {
-
             pthread_mutex_lock(&print_mutex);
             printf("\nResetting due to timeout at max level (no success in %d seconds)\n",
                    MAX_TIME_AT_LEVEL);
@@ -423,6 +672,12 @@ void *find_division_path_thread(void *arg)
                     intermediate_pubkeys[step_count][131] = '\0';
                 }
             }
+
+            // Update current_path before checking bloom filters
+            pthread_mutex_lock(&print_mutex); // Use print_mutex to protect current_path
+            strncpy(current_path, path, sizeof(current_path) - 1);
+            current_path[sizeof(current_path) - 1] = '\0';
+            pthread_mutex_unlock(&print_mutex);
 
             // Print status for thread 0
             if (args->thread_id == 0)
@@ -616,63 +871,236 @@ void *find_division_path_thread(void *arg)
     return NULL;
 }
 
-// Bloom filter operations
+// Estimates the size of a bloom filter in bytes
+uint64_t estimate_bloom_size(uint64_t items, double fp_rate)
+{
+    return (uint64_t)((-1.0 * items * log(fp_rate)) / (log(2.0) * log(2.0))) / 8;
+}
+
+void print_memory_requirements()
+{
+    // Calculate bloom filter sizes using existing defines
+    uint64_t bloom1_size = estimate_bloom_size(MAX_ENTRIES1, BLOOM1_FP_RATE);
+    uint64_t bloom2_size = estimate_bloom_size(MAX_ENTRIES2, BLOOM2_FP_RATE);
+    uint64_t bloom3_size = estimate_bloom_size(MAX_ENTRIES3, BLOOM3_FP_RATE);
+
+    // Convert to MB for display
+    double bloom1_mb = bloom1_size / (1024.0 * 1024.0);
+    double bloom2_mb = bloom2_size / (1024.0 * 1024.0);
+    double bloom3_mb = bloom3_size / (1024.0 * 1024.0);
+    double total_mb = bloom1_mb + bloom2_mb + bloom3_mb;
+
+    printf("\nEstimated memory requirements:\n");
+    printf("Bloom filter 1 (%d entries): %.2f MB\n", MAX_ENTRIES1, bloom1_mb);
+    printf("Bloom filter 2 (%d entries): %.2f MB\n", MAX_ENTRIES2, bloom2_mb);
+    printf("Bloom filter 3 (%d entries): %.2f MB\n", MAX_ENTRIES3, bloom3_mb);
+    printf("Total bloom filters: %.2f MB\n\n", total_mb);
+
+    // Check available system memory
+#if defined(_WIN64) && !defined(__CYGWIN__)
+    MEMORYSTATUSEX statex;
+    statex.dwLength = sizeof(statex);
+    GlobalMemoryStatusEx(&statex);
+    uint64_t available_mb = statex.ullAvailPhysMem / (1024 * 1024);
+#else
+    uint64_t pages = sysconf(_SC_PHYS_PAGES);
+    uint64_t page_size = sysconf(_SC_PAGE_SIZE);
+    uint64_t available_mb = ((uint64_t)pages * (uint64_t)page_size) / (1024 * 1024);
+#endif
+
+    printf("Available system memory: %llu MB\n", (unsigned long long)available_mb);
+
+    if (total_mb > available_mb * 0.9)
+    {
+        printf("\nWARNING: Estimated memory usage (%.2f MB) is close to or exceeds available memory (%llu MB)\n",
+               total_mb, (unsigned long long)available_mb);
+        printf("Consider reducing MAX_ENTRIES or adjusting bloom filter parameters\n");
+    }
+    else
+    {
+        printf("Memory requirements are within safe limits (%.1f%% of available memory)\n",
+               (total_mb / available_mb) * 100);
+    }
+}
+
 int init_multi_bloom_from_file(const char *filename)
 {
-    FILE *file = fopen(filename, "r");
-    if (!file)
+    if (!init_search_file(filename))
     {
-        printf("Error: Cannot open bloom filter file %s\n", filename);
         return 0;
     }
 
-    if (bloom_init2(&bloom_filter1, MAX_ENTRIES1, FP_RATE1) != 0 ||
-        bloom_init2(&bloom_filter2, MAX_ENTRIES2, FP_RATE2) != 0 ||
-        bloom_init2(&bloom_filter3, MAX_ENTRIES3, FP_RATE3) != 0)
+    print_memory_requirements();
+
+    // Initialize bloom filters
+    if (bloom_init2(&bloom_filter1, MAX_ENTRIES1, BLOOM1_FP_RATE) != 0 ||
+        bloom_init2(&bloom_filter2, MAX_ENTRIES2, BLOOM2_FP_RATE) != 0 ||
+        bloom_init2(&bloom_filter3, MAX_ENTRIES3, BLOOM3_FP_RATE) != 0)
     {
         printf("Error: Failed to initialize bloom filters\n");
-        fclose(file);
         return 0;
     }
 
-    bloom_initialized1 = true;
-    bloom_initialized2 = true;
-    bloom_initialized3 = true;
+    bloom_initialized1 = bloom_initialized2 = bloom_initialized3 = true;
 
-    printf("Initialized bloom filters:\n");
-    printf("Filter 1: %d entries, FP rate: %.6f%%\n", MAX_ENTRIES1, FP_RATE1 * 100);
-    printf("Filter 2: %d entries, FP rate: %.6f%%\n", MAX_ENTRIES2, FP_RATE2 * 100);
-    printf("Filter 3: %d entries, FP rate: %.6f%%\n", MAX_ENTRIES3, FP_RATE3 * 100);
-
-    char pubkey[132];
-    size_t count = 0;
-
-    while (fgets(pubkey, sizeof(pubkey), file) && count < MAX_ENTRIES1)
+    // Memory map the file for faster reading
+    int fd = fileno(search_file_info.file);
+    struct stat sb;
+    if (fstat(fd, &sb) == -1)
     {
-        pubkey[strcspn(pubkey, "\n")] = 0;
-
-        bloom_add(&bloom_filter1, pubkey, strlen(pubkey));
-
-        XXH64_hash_t hash = XXH64(pubkey, strlen(pubkey), 0x1234);
-        bloom_add(&bloom_filter2, (char *)&hash, sizeof(hash));
-
-        hash = XXH64(pubkey, strlen(pubkey), 0x5678);
-        bloom_add(&bloom_filter3, (char *)&hash, sizeof(hash));
-
-        count++;
-        if (count % 1000000 == 0)
-        {
-            printf("Loaded %zu million entries into bloom filters\n", count / 1000000);
-        }
+        perror("fstat");
+        return 0;
     }
 
-    printf("Finished loading %zu entries into all bloom filters\n", count);
-    fclose(file);
+    // Determine number of threads based on CPU cores
+    int num_threads = sysconf(_SC_NPROCESSORS_ONLN);
+    if (num_threads > 24)
+        num_threads = 24; // Cap at 16 threads
+
+    // Calculate entries per thread
+    size_t entry_size = search_file_info.is_binary ? COMPRESSED_PUBKEY_SIZE : HEX_PUBKEY_SIZE;
+    size_t total_entries = sb.st_size / entry_size;
+    size_t entries_per_thread = (total_entries + num_threads - 1) / num_threads;
+
+    // Allocate worker structures
+    struct bloom_load_worker *workers = malloc(num_threads * sizeof(struct bloom_load_worker));
+    pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
+
+    // Read file in chunks and process in parallel
+    unsigned char *buffer = malloc(BUFFER_SIZE);
+    size_t entries_processed = 0;
+    size_t bytes_read;
+
+    printf("Loading bloom filters using %d threads...\n", num_threads);
+    time_t start_time = time(NULL);
+
+    while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, search_file_info.file)) > 0)
+    {
+        size_t entries_in_buffer = bytes_read / entry_size;
+        size_t entries_per_worker = (entries_in_buffer + num_threads - 1) / num_threads;
+
+        // Create worker threads
+        for (int i = 0; i < num_threads; i++)
+        {
+            workers[i].bloom1 = &bloom_filter1;
+            workers[i].bloom2 = &bloom_filter2;
+            workers[i].bloom3 = &bloom_filter3;
+            workers[i].is_binary = search_file_info.is_binary;
+
+            size_t start_entry = i * entries_per_worker;
+            if (start_entry >= entries_in_buffer)
+                break;
+
+            workers[i].entries = buffer + (start_entry * entry_size);
+            workers[i].num_entries = (i == num_threads - 1) ? entries_in_buffer - start_entry : entries_per_worker;
+
+            pthread_create(&threads[i], NULL, bloom_load_worker_thread, &workers[i]);
+        }
+
+        // Wait for all threads to complete
+        for (int i = 0; i < num_threads; i++)
+        {
+            pthread_join(threads[i], NULL);
+        }
+
+        entries_processed += entries_in_buffer;
+
+        // Print progress
+        time_t current_time = time(NULL);
+        double elapsed = difftime(current_time, start_time);
+        double rate = entries_processed / elapsed;
+        printf("\rProcessed %zu entries (%.2f entries/sec)...",
+               entries_processed, rate);
+        fflush(stdout);
+    }
+
+    printf("\nCompleted loading %zu entries in %.1f seconds\n",
+           entries_processed, difftime(time(NULL), start_time));
+
+    // Cleanup
+    free(buffer);
+    free(workers);
+    free(threads);
+
+    // Reset file position for future reads
+    fseek(search_file_info.file, 0, SEEK_SET);
     return 1;
+}
+
+bool triple_bloom_check(const char *pubkey)
+{
+    // Basic validation
+    if (!pubkey || strlen(pubkey) < 66)
+    {
+        return false;
+    }
+
+    // Make sure bloom filters are initialized
+    if (!bloom_initialized1 || !bloom_initialized2 || !bloom_initialized3)
+    {
+        printf("Error: Bloom filters not initialized\n");
+        return false;
+    }
+
+    // First bloom filter: Check prefix (fastest)
+    if (!bloom_check(&bloom_filter1, pubkey, PUBKEY_PREFIX_LENGTH))
+    {
+        return false;
+    }
+
+    // Second bloom filter: Check with first hash
+    XXH64_hash_t hash1 = XXH64(pubkey, strlen(pubkey), 0x1234);
+    if (!bloom_check(&bloom_filter2, (char *)&hash1, sizeof(hash1)))
+    {
+        return false;
+    }
+
+    // Third bloom filter: Check with second hash
+    XXH64_hash_t hash2 = XXH64(pubkey, strlen(pubkey), 0x5678);
+    if (!bloom_check(&bloom_filter3, (char *)&hash2, sizeof(hash2)))
+    {
+        return false;
+    }
+
+    // If we get here, the pubkey passed all bloom filters
+    // Now do binary search verification
+    int64_t index = binary_search_pubkey(pubkey);
+
+    if (index >= 0)
+    {
+        // Found a verified match
+        pthread_mutex_lock(&print_mutex);
+        printf("\nVerified match found!\n");
+        printf("Index: %ld\n", index);
+        printf("Public Key: %s\n", pubkey);
+
+        // If it's a binary file, show position in bytes
+        if (search_file_info.is_binary)
+        {
+            printf("File Position: %ld bytes\n", index * COMPRESSED_PUBKEY_SIZE);
+        }
+
+        // Save the match to file with the index
+        char match_info[256];
+        snprintf(match_info, sizeof(match_info), "Index: %ld, Key: %s", index, pubkey);
+        save_path_to_file(current_path, match_info, true);
+
+        pthread_mutex_unlock(&print_mutex);
+        return true;
+    }
+
+    // If binary search didn't find it, it was a bloom filter false positive
+    return false;
 }
 
 void cleanup_bloom_filters(void)
 {
+    if (search_file_info.file)
+    {
+        fclose(search_file_info.file);
+        pthread_mutex_destroy(&search_file_info.file_mutex);
+    }
+
     if (bloom_initialized1)
     {
         bloom_free(&bloom_filter1);
@@ -685,33 +1113,6 @@ void cleanup_bloom_filters(void)
     {
         bloom_free(&bloom_filter3);
     }
-}
-
-bool triple_bloom_check(const char *pubkey)
-{
-    if (!bloom_initialized1 || !bloom_initialized2 || !bloom_initialized3)
-    {
-        return false;
-    }
-
-    if (!bloom_check(&bloom_filter1, pubkey, strlen(pubkey)))
-    {
-        return false;
-    }
-
-    XXH64_hash_t hash = XXH64(pubkey, strlen(pubkey), 0x1234);
-    if (!bloom_check(&bloom_filter2, (char *)&hash, sizeof(hash)))
-    {
-        return false;
-    }
-
-    hash = XXH64(pubkey, strlen(pubkey), 0x5678);
-    if (!bloom_check(&bloom_filter3, (char *)&hash, sizeof(hash)))
-    {
-        return false;
-    }
-
-    return true;
 }
 
 // Public key operations
