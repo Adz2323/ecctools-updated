@@ -32,7 +32,7 @@ const char *VERSION = "1.0.0";
 #define TARGET_MAX_DIVISIONS 134
 #define MIN_SUBTRACTIONS 10
 #define MAX_SUBTRACTIONS 100
-#define PATHS_PER_SUBTRACTION_LEVEL 50000
+#define PATHS_PER_SUBTRACTION_LEVEL 5000
 #define MAX_TIME_AT_LEVEL 900     // 5 minutes in seconds
 #define PATH_CHECK_INTERVAL 1000  // Check every 1000 attempts
 #define COMPRESSED_PUBKEY_SIZE 33 // Size of binary compressed pubkey
@@ -954,8 +954,8 @@ int init_multi_bloom_from_file(const char *filename)
 
     // Determine number of threads based on CPU cores
     int num_threads = sysconf(_SC_NPROCESSORS_ONLN);
-    if (num_threads > 256)
-        num_threads = 256; // Cap 
+    if (num_threads > 64)
+        num_threads = 64; // Cap 
 
     // Calculate entries per thread
     size_t entry_size = search_file_info.is_binary ? COMPRESSED_PUBKEY_SIZE : HEX_PUBKEY_SIZE;
