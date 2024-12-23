@@ -7,24 +7,25 @@
 
 #define MY_ADDRESS "3989LYRH3bauPigYs8HSTAg8kGGNHtvgjF"
 #define PERCENTAGE 0.95
-#define ELECTRUM_PATH "./electrum-4.4.6-x86_64.AppImage"
+#define ELECTRUM_PATH "../Electrum-4.4.6/electrum"
 
 void start_electrum_daemon()
 {
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "%s daemon -d", ELECTRUM_PATH);
+    // Use python3 to run the Electrum commands
+    snprintf(cmd, sizeof(cmd), "cd ../Electrum-4.4.6 && python3 -m electrum daemon -d");
     system(cmd);
     sleep(2);
     
-    snprintf(cmd, sizeof(cmd), "%s daemon setconfig rpcport 7777", ELECTRUM_PATH);
+    snprintf(cmd, sizeof(cmd), "cd ../Electrum-4.4.6 && python3 -m electrum daemon setconfig rpcport 7777");
     system(cmd);
     
-    snprintf(cmd, sizeof(cmd), "%s daemon load_wallet", ELECTRUM_PATH);
+    snprintf(cmd, sizeof(cmd), "cd ../Electrum-4.4.6 && python3 -m electrum daemon load_wallet");
     system(cmd);
     sleep(1);
 
     // Verify daemon is running
-    snprintf(cmd, sizeof(cmd), "%s daemon status", ELECTRUM_PATH);
+    snprintf(cmd, sizeof(cmd), "cd ../Electrum-4.4.6 && python3 -m electrum daemon status");
     system(cmd);
 }
 
