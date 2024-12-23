@@ -3,7 +3,7 @@
 # Exit on error
 set -e
 
-echo "Starting Electrum installation..."
+echo "Starting QuickNode program installation..."
 
 # Function to check if a command was successful
 check_status() {
@@ -20,70 +20,52 @@ echo "Updating system packages..."
 sudo apt update && sudo apt upgrade -y
 check_status "System update"
 
-# Install system dependencies
+# Install required system dependencies
 echo "Installing system dependencies..."
 sudo apt-get install -y \
-    root-repo \
-    git \
     build-essential \
+    libcurl4-openssl-dev \
+    libjson-c-dev \
+    libgmp-dev \
     libssl-dev \
     libgcrypt20-dev \
-    libgmp-dev \
-    libjson-c-dev \
-    libcurl4-openssl-dev \
-    python3-pip \
-    automake \
-    autoconf \
-    libtool \
-    libsecp256k1-dev \
-    python3-setuptools \
-    python3-pyqt6 \
-    python3-cryptography \
-    python3-requests \
-    gettext \
-    qttools5-dev-tools
+    gcc \
+    git
 check_status "System dependencies installation"
 
-# Create a directory for Electrum
-echo "Creating installation directory..."
-mkdir -p ~/electrum
-cd ~/electrum
-check_status "Directory creation"
-
-# Clone Electrum repository
-echo "Cloning Electrum repository..."
-git clone https://github.com/spesmilo/electrum.git .
-check_status "Repository cloning"
-
-# Initialize and update git submodules
-echo "Initializing git submodules..."
-git submodule update --init
-check_status "Git submodules initialization"
-
-# Install Python dependencies
-echo "Installing Python dependencies..."
-python3 -m pip install --user -e ".[gui,crypto]"
-check_status "Python dependencies installation"
-
-# Pull locale files for translations
-echo "Pulling locale files..."
-./contrib/pull_locale
-check_status "Locale files"
-
-# Add ~/.local/bin to PATH if it's not already there
-if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
-    echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-    echo "Added ~/.local/bin to PATH"
+# Clone the repository (if required)
+WORK_DIR=~/quicknode_program
+if [ ! -d "$WORK_DIR" ]; then
+    echo "Creating program directory..."
+    mkdir -p "$WORK_DIR"
+    check_status "Directory creation"
 fi
 
-echo "Installation completed!"
-echo "You can now run Electrum by typing 'electrum' in the terminal"
-echo "Or run it directly with: ~/electrum/run_electrum"
+# Move to the working directory
+cd "$WORK_DIR"
 
-# Provide option to run Electrum immediately
-read -p "Would you like to run Electrum now? (y/n) " -n 1 -r
+# Copy the program source code (assuming it's available in the same directory as this script)
+echo "Copying source code to the program directory..."
+cp "$(dirname "$0")/quicknode_rpc.c" "$WORK_DIR/"
+check_status "Source code copied"
+
+# Compile the program
+echo "Compiling the program..."
+gcc quicknode_rpc.c -o quicknode_rpc -lcurl -ljson-c -lgmp -lgcrypt -lssl
+check_status "Program compilation"
+
+# Cleanup old builds (optional)
+echo "Cleaning up old builds..."
+find . -type f -name '*.o' -delete
+check_status "Cleanup completed"
+
+# Inform the user
+echo "Installation and build completed successfully!"
+echo "You can run the program with: ./quicknode_rpc"
+
+# Offer to run the program immediately
+read -p "Would you like to run the program now? (y/n) " -n 1 -r
 echo
-if [[ $REPLY =~ ^[Yy]$ ]]
-then
-    ./run_electrum
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    ./quicknode_rpc
 fi
