@@ -66,7 +66,7 @@ void make_transfer(CURL *curl, const char *amount, const char *private_key) {
     // Step 1: Create raw transaction
     char create_tx_json[1024];
     snprintf(create_tx_json, sizeof(create_tx_json),
-             "{\"jsonrpc\":\"1.0\",\"id\":\"createtx\",\"method\":\"createrawtransaction\",\"params\":[[{\"txid\":\"<TXID>\",\"vout\":<VOUT>}],{\"%s\":%s}]}\",
+             "{\"jsonrpc\":\"1.0\",\"id\":\"createtx\",\"method\":\"createrawtransaction\",\"params\":[[{\"txid\":\"<TXID>\",\"vout\":<VOUT>}],{\"%s\":%s}]}",
              MY_ADDRESS, amount);
 
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, create_tx_json);
@@ -83,15 +83,21 @@ void make_transfer(CURL *curl, const char *amount, const char *private_key) {
     struct json_object *parsed_json = json_tokener_parse(resp.data);
     struct json_object *result;
     json_object_object_get_ex(parsed_json, "result", &result);
-    const char *raw_tx = json_object_get_string(result);
 
+    if (!result) {
+        fprintf(stderr, "Error: Unable to create raw transaction. Response: %s\n", resp.data);
+        free(resp.data);
+        return;
+    }
+
+    const char *raw_tx = json_object_get_string(result);
     free(resp.data);
     resp.data = NULL;
 
     // Step 2: Sign raw transaction
     char sign_tx_json[1024];
     snprintf(sign_tx_json, sizeof(sign_tx_json),
-             "{\"jsonrpc\":\"1.0\",\"id\":\"signtx\",\"method\":\"signrawtransactionwithkey\",\"params\":[\"%s\",[\"%s\"]]}\",
+             "{\"jsonrpc\":\"1.0\",\"id\":\"signtx\",\"method\":\"signrawtransactionwithkey\",\"params\":[\"%s\",[\"%s\"]]}",
              raw_tx, private_key);
 
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, sign_tx_json);
@@ -103,10 +109,16 @@ void make_transfer(CURL *curl, const char *amount, const char *private_key) {
 
     parsed_json = json_tokener_parse(resp.data);
     json_object_object_get_ex(parsed_json, "result", &result);
+
+    if (!result) {
+        fprintf(stderr, "Error: Unable to sign transaction. Response: %s\n", resp.data);
+        free(resp.data);
+        return;
+    }
+
     struct json_object *hex;
     json_object_object_get_ex(result, "hex", &hex);
     const char *signed_tx = json_object_get_string(hex);
-
     free(resp.data);
     resp.data = NULL;
 
@@ -156,6 +168,12 @@ int main() {
 
         double balance = get_balance(curl);
         printf("Current balance: %.8f BTC\n", balance);
+
+        if (balance == 0.0) {
+            printf("Insufficient balance. Transaction cannot proceed.\n");
+            curl_easy_cleanup(curl);
+            return 0;
+        }
 
         char amount[20];
         snprintf(amount, sizeof(amount), "%.8f", balance * PERCENTAGE);
