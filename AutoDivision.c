@@ -26,13 +26,13 @@
 const char *VERSION = "1.0.0";
 
 // Optimization constants
-#define OPTIMAL_MIN_STEPS 144
-#define OPTIMAL_MAX_STEPS 234
-#define TARGET_MIN_DIVISIONS 134
-#define TARGET_MAX_DIVISIONS 134
+#define OPTIMAL_MIN_STEPS 170
+#define OPTIMAL_MAX_STEPS 320
+#define TARGET_MIN_DIVISIONS 160
+#define TARGET_MAX_DIVISIONS 160
 #define MIN_SUBTRACTIONS 10
-#define MAX_SUBTRACTIONS 100
-#define PATHS_PER_SUBTRACTION_LEVEL 5000
+#define MAX_SUBTRACTIONS 160
+#define PATHS_PER_SUBTRACTION_LEVEL 5
 #define MAX_TIME_AT_LEVEL 900     // 5 minutes in seconds
 #define PATH_CHECK_INTERVAL 1000  // Check every 1000 attempts
 #define COMPRESSED_PUBKEY_SIZE 33 // Size of binary compressed pubkey
@@ -47,9 +47,10 @@ const char *VERSION = "1.0.0";
 #define MAX_ENTRIES2 8000000000
 #define MAX_ENTRIES3 6000000000
 #define PUBKEY_PREFIX_LENGTH 6
-#define BLOOM1_FP_RATE 0.00001
-#define BLOOM2_FP_RATE 0.000001
-#define BLOOM3_FP_RATE 0.0000001
+// #define BLOOM_PREFIX_LENGTH 6
+#define BLOOM1_FP_RATE 0.0001
+#define BLOOM2_FP_RATE 0.00001
+#define BLOOM3_FP_RATE 0.000001
 #define BUFFER_SIZE (1024 * 1024) // 1MB buffer
 #define WORKER_BATCH_SIZE 10000   // Number of entries per worker batch
 
@@ -182,27 +183,41 @@ void *bloom_load_worker_thread(void *arg)
     {
         if (worker->is_binary)
         {
-            // Convert binary pubkey to hex
+            // Binary input (33 bytes): Skip prefix byte and use next PUBKEY_PREFIX_LENGTH bytes
             const unsigned char *pubkey_data = worker->entries + (i * COMPRESSED_PUBKEY_SIZE);
-            for (int j = 0; j < COMPRESSED_PUBKEY_SIZE; j++)
-            {
-                snprintf(pubkey_hex + (j * 2), 3, "%02x", pubkey_data[j]);
-            }
-            pubkey_hex[66] = '\0';
+
+            // Add prefix of X coordinate to first bloom filter (skip the 02/03 byte)
+            bloom_add(worker->bloom1, (char *)(pubkey_data + 1), PUBKEY_PREFIX_LENGTH);
+
+            // Use full X coordinate for second bloom filter with hash
+            XXH64_hash_t hash = XXH64(pubkey_data + 1, 32, 0x1234);
+            bloom_add(worker->bloom2, (char *)&hash, sizeof(hash));
+
+            // Use different hash for third bloom filter
+            hash = XXH64(pubkey_data + 1, 32, 0x5678);
+            bloom_add(worker->bloom3, (char *)&hash, sizeof(hash));
         }
         else
         {
-            // Copy hex pubkey directly
+            // Converting hex string to binary, skipping first byte pair
             memcpy(pubkey_hex, worker->entries + (i * HEX_PUBKEY_SIZE), 66);
             pubkey_hex[66] = '\0';
-        }
 
-        // Add to bloom filters
-        bloom_add(worker->bloom1, pubkey_hex, PUBKEY_PREFIX_LENGTH);
-        XXH64_hash_t hash = XXH64(pubkey_hex, 66, 0x1234);
-        bloom_add(worker->bloom2, (char *)&hash, sizeof(hash));
-        hash = XXH64(pubkey_hex, 66, 0x5678);
-        bloom_add(worker->bloom3, (char *)&hash, sizeof(hash));
+            // Convert just the X coordinate part (skip first byte pair)
+            unsigned char x_coord[32];
+            hexs2bin(pubkey_hex + 2, x_coord);
+
+            // Add prefix to first bloom filter
+            bloom_add(worker->bloom1, (char *)x_coord, PUBKEY_PREFIX_LENGTH);
+
+            // Add hash to second bloom filter
+            XXH64_hash_t hash = XXH64(x_coord, 32, 0x1234);
+            bloom_add(worker->bloom2, (char *)&hash, sizeof(hash));
+
+            // Add different hash to third bloom filter
+            hash = XXH64(x_coord, 32, 0x5678);
+            bloom_add(worker->bloom3, (char *)&hash, sizeof(hash));
+        }
     }
 
     return NULL;
@@ -462,7 +477,8 @@ bool should_divide(struct DivisionControl *ctrl, int current_divisions,
     pthread_mutex_lock(&ctrl->mutex);
 
     // Calculate maximum allowed path length
-    int max_path_length = TARGET_MAX_DIVISIONS + ctrl->current_subtractions;
+    // Calculate maximum allowed path length
+    int max_path_length = TARGET_MAX_DIVISIONS + TARGET_MIN_DIVISIONS + ctrl->current_subtractions;
 
     // Calculate remaining operations needed
     int needed_divisions = TARGET_MIN_DIVISIONS - current_divisions;
@@ -955,7 +971,7 @@ int init_multi_bloom_from_file(const char *filename)
     // Determine number of threads based on CPU cores
     int num_threads = sysconf(_SC_NPROCESSORS_ONLN);
     if (num_threads > 64)
-        num_threads = 64; // Cap 
+        num_threads = 64;
 
     // Calculate entries per thread
     size_t entry_size = search_file_info.is_binary ? COMPRESSED_PUBKEY_SIZE : HEX_PUBKEY_SIZE;
@@ -994,7 +1010,11 @@ int init_multi_bloom_from_file(const char *filename)
             workers[i].entries = buffer + (start_entry * entry_size);
             workers[i].num_entries = (i == num_threads - 1) ? entries_in_buffer - start_entry : entries_per_worker;
 
-            pthread_create(&threads[i], NULL, bloom_load_worker_thread, &workers[i]);
+            if (pthread_create(&threads[i], NULL, bloom_load_worker_thread, &workers[i]) != 0)
+            {
+                printf("Error creating thread %d\n", i);
+                return 0;
+            }
         }
 
         // Wait for all threads to complete
@@ -1029,67 +1049,103 @@ int init_multi_bloom_from_file(const char *filename)
 
 bool triple_bloom_check(const char *pubkey)
 {
-    // Basic validation
     if (!pubkey || strlen(pubkey) < 66)
     {
         return false;
     }
 
-    // Make sure bloom filters are initialized
     if (!bloom_initialized1 || !bloom_initialized2 || !bloom_initialized3)
     {
         printf("Error: Bloom filters not initialized\n");
         return false;
     }
 
-    // First bloom filter: Check prefix (fastest)
-    if (!bloom_check(&bloom_filter1, pubkey, PUBKEY_PREFIX_LENGTH))
+    unsigned char x_coord[32];
+    hexs2bin(pubkey + 2, x_coord);
+
+    // First bloom filter check - prefix of X coordinate
+    if (!bloom_check(&bloom_filter1, (char *)x_coord, PUBKEY_PREFIX_LENGTH))
     {
         return false;
     }
 
-    // Second bloom filter: Check with first hash
-    XXH64_hash_t hash1 = XXH64(pubkey, strlen(pubkey), 0x1234);
+    // Second bloom filter check - hash of full X coordinate
+    XXH64_hash_t hash1 = XXH64(x_coord, 32, 0x1234);
     if (!bloom_check(&bloom_filter2, (char *)&hash1, sizeof(hash1)))
     {
         return false;
     }
 
-    // Third bloom filter: Check with second hash
-    XXH64_hash_t hash2 = XXH64(pubkey, strlen(pubkey), 0x5678);
+    // Third bloom filter check - different hash of full X coordinate
+    XXH64_hash_t hash2 = XXH64(x_coord, 32, 0x5678);
     if (!bloom_check(&bloom_filter3, (char *)&hash2, sizeof(hash2)))
     {
         return false;
     }
 
-    // If we get here, the pubkey passed all bloom filters
-    // Now do binary search verification
+    // Binary search for exact match
     int64_t index = binary_search_pubkey(pubkey);
 
     if (index >= 0)
     {
-        // Found a verified match
         pthread_mutex_lock(&print_mutex);
         printf("\nVerified match found!\n");
         printf("Index: %ld\n", index);
         printf("Public Key: %s\n", pubkey);
+        printf("Line Number Private Key (Hex): %lX\n", index);
 
-        // If it's a binary file, show position in bytes
+        // Start with the line number as our private key
+        uint64_t current_privkey = index;
+
+        // Split the path into steps
+        char *path_copy = strdup(current_path);
+        char *token = strtok(path_copy, ",");
+        char *steps[1000];
+        int step_count = 0;
+
+        // Store all steps
+        while (token != NULL && step_count < 1000)
+        {
+            steps[step_count++] = strdup(token);
+            token = strtok(NULL, ",");
+        }
+
+        // Work backwards through the path to find original private key
+        for (int i = step_count - 1; i >= 0; i--)
+        {
+            if (strstr(steps[i], "/2"))
+            {
+                // If it was divided by 2, multiply by 2
+                current_privkey *= 2;
+                printf("After reversing %s: %lX\n", steps[i], current_privkey);
+            }
+            else if (strstr(steps[i], "-1"))
+            {
+                // If it was subtracted by 1, subtract 1
+                current_privkey -= 1;
+                printf("After reversing %s: %lX\n", steps[i], current_privkey);
+            }
+            free(steps[i]);
+        }
+        free(path_copy);
+
+        printf("Original Private Key: %lX\n", current_privkey);
+
         if (search_file_info.is_binary)
         {
             printf("File Position: %ld bytes\n", index * COMPRESSED_PUBKEY_SIZE);
         }
 
-        // Save the match to file with the index
-        char match_info[256];
-        snprintf(match_info, sizeof(match_info), "Index: %ld, Key: %s", index, pubkey);
+        char match_info[512];
+        snprintf(match_info, sizeof(match_info),
+                 "Index: %ld, Key: %s, Line PrivKey: %lX, Original PrivKey: %lX",
+                 index, pubkey, index, current_privkey);
         save_path_to_file(current_path, match_info, true);
 
         pthread_mutex_unlock(&print_mutex);
         return true;
     }
 
-    // If binary search didn't find it, it was a bloom filter false positive
     return false;
 }
 
