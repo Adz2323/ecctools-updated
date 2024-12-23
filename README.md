@@ -39,6 +39,7 @@ apt install libgcrypt20-dev
 apt install libgmp-dev
 apt-get install libjson-c-dev
 apt-get install libcurl4-openssl-dev python3-pip
+apt-get install automake autoconf libtool
 # Add repository and install
 sudo add-apt-repository ppa:luke-jr/bitcoincore
 sudo apt-get update
