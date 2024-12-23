@@ -1,126 +1,94 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <sys/wait.h>
-#include <signal.h>
-#include <sys/types.h>
+#include <iostream>
+#include <string>
+#include <memory>
+#include <array>
+#include <regex>
+#include <thread>
+#include <chrono>
+#include <sstream>
 
-#define MAX_CMD_LENGTH 1024
-
-// Global flag for signal handling
-volatile sig_atomic_t stop_flag = 0;
-pid_t child_pid = -1; // Global to track subprocesses
-
-void signal_handler(int signum)
-{
-    if (signum == SIGINT)
-    {
-        printf("\n[+] Caught interrupt signal, cleaning up...\n");
-        stop_flag = 1;
-        if (child_pid > 0)
-        {
-            kill(child_pid, SIGKILL); // Terminate child process
-        }
+std::string exec(const char* cmd) {
+    std::array<char, 128> buffer;
+    std::string result;
+    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd, "r"), pclose);
+    
+    if (!pipe) {
+        throw std::runtime_error("popen() failed!");
     }
+    
+    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
+        result += buffer.data();
+    }
+    
+    return result;
 }
 
-int run_command(const char *cmd)
-{
-    child_pid = fork();
-    if (child_pid == 0)
-    {
-        // Child process
-        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
-        perror("[E] Failed to execute command");
-        exit(1);
+std::string runKeydivision(std::string& linePrivKey) {
+    std::string cmd = "./Auto -f scanned_pubkeys.bin -b 160 -t 2 "
+                     "02145d2611c823a396ef6712ce0f712f09b9b4f3135e3e0aa3230fb9b6d08d1e16 "
+                     "02e0a8b039282faf6fe0fd769cfbc4b6b4cf8758ba68220eac420e32b91ddfa673 "
+                     "035cd1854cae45391ca4ec428cc7e6c7d9984424b954209a8eea197b9e364c05f6 "
+                     "03137807790ea7dc6e97901c2bc87411f45ed74a5629315c4e4b03a0a102250c49 "
+                     "03afdda497369e219a2c1c369954a930e4d3740968e5e4352475bcffce3140dae5 "
+                     "03afdda497369e219a2c1c369954a930e4d3740968e5e4352475bcffce3140dae5 "
+                     "031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640";
+    
+    std::cout << "Running keydivision..." << std::endl;
+    std::string output = exec(cmd.c_str());
+    
+    // Regular expressions to find both private keys
+    std::regex linePrivKeyRegex("Line Number Private Key \\(Hex\\): ([a-fA-F0-9]+)");
+    std::regex origPrivKeyRegex("Original Private Key: ([a-fA-F0-9]+)");
+    std::smatch match;
+    
+    // Store the line number private key
+    if (std::regex_search(output, match, linePrivKeyRegex)) {
+        linePrivKey = match[1].str();
     }
-    else if (child_pid > 0)
-    {
-        // Parent process
-        int status;
-        waitpid(child_pid, &status, 0);
-        child_pid = -1; // Reset child_pid after process ends
-        return WEXITSTATUS(status);
+    
+    // Find and return the original private key
+    if (std::regex_search(output, match, origPrivKeyRegex)) {
+        std::string origPrivKey = match[1].str();
+        std::cout << "Found original private key: " << origPrivKey << std::endl;
+        return origPrivKey;
     }
-    else
-    {
-        perror("[E] Fork failed");
-        return 1;
-    }
+    
+    return "";
 }
 
-int main(int argc, char **argv)
-{
-    if (argc != 3)
-    {
-        printf("Usage: %s <input_pubkey> <target_pubkey>\n", argv[0]);
+void runElectrum(const std::string& privateKey) {
+    // Start electrum process
+    FILE* electrum = popen("./electrum", "w");
+    if (!electrum) {
+        std::cerr << "Failed to start Electrum" << std::endl;
+        return;
+    }
+    
+    // Wait a moment for Electrum to initialize
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    
+    // Write the original private key to Electrum's stdin
+    fprintf(electrum, "%s\n", privateKey.c_str());
+    fflush(electrum);
+    
+    // Close the pipe
+    pclose(electrum);
+}
+
+int main() {
+    std::string linePrivKey;
+    std::string origPrivKey = runKeydivision(linePrivKey);
+    
+    if (!origPrivKey.empty()) {
+        std::cout << "Successfully found private keys:" << std::endl;
+        std::cout << "Line Number Private Key: " << linePrivKey << std::endl;
+        std::cout << "Original Private Key: " << origPrivKey << std::endl;
+        std::cout << "Starting Electrum with original private key..." << std::endl;
+        runElectrum(origPrivKey);
+    } else {
+        std::cout << "No private key found in keydivision output." << std::endl;
         return 1;
     }
-
-    // Set up signal handling
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = signal_handler;
-    sigaction(SIGINT, &sa, NULL);
-
-    char div_cmd[MAX_CMD_LENGTH];
-    char keyhunt_cmd[MAX_CMD_LENGTH];
-    int iteration = 1;
-
-    while (!stop_flag)
-    {
-        printf("\n[+] Starting iteration %d\n", iteration);
-
-        // Run keydivision with spiral mode and -k option
-        snprintf(div_cmd, MAX_CMD_LENGTH,
-                 "./div --spiral %s %s -t 16 -k",
-                 argv[1], argv[2]);
-
-        if (run_command(div_cmd) != 0)
-        {
-            printf("[E] Error running keydivision\n");
-            break;
-        }
-
-        if (stop_flag)
-            break;
-
-        // Run keyhunt - unchanged as it still uses the same 135.txt file
-        snprintf(keyhunt_cmd, MAX_CMD_LENGTH,
-                 "./keyhunt -m xpoint -f 135.txt -r 1:3fffffff -t 16 -l compress");
-
-        int ret = run_command(keyhunt_cmd);
-
-        if (stop_flag)
-            break;
-
-        // Check if keyhunt found a match
-        FILE *keyhunt_output = fopen("KEYFOUNDKEYFOUND.txt", "r");
-        if (keyhunt_output != NULL)
-        {
-            printf("\n[+] Match found!\n");
-            char line[256];
-            while (fgets(line, sizeof(line), keyhunt_output))
-            {
-                printf("%s", line);
-            }
-            fclose(keyhunt_output);
-            break;
-        }
-
-        printf("[+] No match found in iteration %d, continuing...\n", iteration);
-        // Remove the binary subtraction store file after each iteration
-        remove("spiral_subtractions.bin");
-        iteration++;
-    }
-
-    if (stop_flag)
-    {
-        printf("[+] Program terminated by user\n");
-        // Clean up the binary subtraction store if interrupted
-        remove("spiral_subtractions.bin");
-    }
-
+    
     return 0;
 }
