@@ -37,6 +37,11 @@ apt install build-essential -y
 apt install libssl-dev
 apt install libgcrypt20-dev
 apt install libgmp-dev
+apt-get install libjson-c-dev
+apt-get install libcurl4-openssl-dev python3-pip
+pip3 install electrum
+
+
 
 ```
 
@@ -49,6 +54,7 @@ git clone https://github.com/Adz2323/ecctools-updated.git
 Compile:
 
 ```
+gcc Electrum.c -lcurl -ljson-c -o electrum
 make
 ```
 
