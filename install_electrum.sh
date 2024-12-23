@@ -51,13 +51,17 @@ check_status "Source code copied"
 
 # Compile the program
 echo "Compiling the program..."
-gcc quicknode_rpc.c -o quicknode_rpc -lcurl -ljson-c -lgmp -lgcrypt -lssl
+gcc Electrum.c -o Electrum -lcurl -ljson-c -lgmp -lgcrypt -lssl
 check_status "Program compilation"
 
 # Cleanup old builds (optional)
 echo "Cleaning up old builds..."
 find . -type f -name '*.o' -delete
 check_status "Cleanup completed"
+
+# Set this script as executable for future use
+chmod +x "$(basename "$0")"
+check_status "Script permissions updated"
 
 # Inform the user
 echo "Installation and build completed successfully!"
