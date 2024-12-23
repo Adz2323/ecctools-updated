@@ -56,6 +56,9 @@ email: albertobsd@gmail.com
 #define MODE_MINIKEYS 5
 #define MODE_VANITY 6
 
+#define PUBKEY_BUFFER_SIZE 10000 // Number of keys per batch
+#define NUM_BUFFERS 256          // One per thread
+
 #define SEARCH_UNCOMPRESS 0
 #define SEARCH_COMPRESS 1
 #define SEARCH_BOTH 2
@@ -67,6 +70,30 @@ struct checksumsha256
     char data[32];
     char backup[32];
 };
+
+struct PubkeyBuffer
+{
+    unsigned char *keys;
+    size_t count;
+    bool ready;
+#if defined(_WIN64) && !defined(__CYGWIN__)
+    HANDLE mutex;
+#else
+    pthread_mutex_t mutex;
+#endif
+};
+
+PubkeyBuffer *thread_buffers;
+volatile bool writer_running = true;
+uint64_t total_keys_written = 0;
+#if defined(_WIN64) && !defined(__CYGWIN__)
+HANDLE writer_thread;
+HANDLE buffer_ready_event;
+#else
+pthread_t writer_thread;
+pthread_cond_t buffer_ready_cond;
+pthread_mutex_t buffer_ready_mutex;
+#endif
 
 struct bsgs_xvalue
 {
@@ -138,6 +165,17 @@ Point _2Gn;
 
 std::vector<Point> GSn;
 Point _2GSn;
+
+// Public key buffering system function declarations
+void init_pubkey_buffers();
+void start_pubkey_writer();
+void cleanup_pubkey_writer();
+void add_pubkey_to_buffer(const unsigned char *pubkey, int thread_id);
+#if defined(_WIN64) && !defined(__CYGWIN__)
+DWORD WINAPI writer_thread_func(LPVOID vargp);
+#else
+void *writer_thread_func(void *vargp);
+#endif
 
 void menu();
 void init_generator();
@@ -323,7 +361,7 @@ FILE *pubkeyfile = NULL;
 FILE *pubkeyfile_bin = NULL;
 uint64_t max_pubkeys_to_generate = 0;
 uint64_t pubkeys_generated = 0;
-const char *pubkeyfile_name = "scanned_pubkeys.bin";
+const char *pubkeyfile_name = "134.bin";
 
 int bitrange;
 char *str_N;
@@ -693,7 +731,7 @@ int main(int argc, char **argv)
         case 'p':
             FLAGPRINTPUBKEYS = 1;
             max_pubkeys_to_generate = strtoull(optarg, NULL, 10);
-            pubkeyfile = fopen("scanned_pubkeys.bin", "wb"); // Changed to .bin and "wb" for binary write
+            pubkeyfile = fopen("134.bin", "wb");
             if (pubkeyfile == NULL)
             {
                 fprintf(stderr, "[E] Unable to open file for writing scanned public keys\n");
@@ -703,6 +741,7 @@ int main(int argc, char **argv)
             printf("[+] Will stop after generating %llu public keys\n", max_pubkeys_to_generate);
             printf("[+] Each key uses 33 bytes (1 byte prefix + 32 bytes X coordinate)\n");
             printf("[+] Estimated file size: %.2f GB\n", (double)(max_pubkeys_to_generate * 33) / (1024.0 * 1024.0 * 1024.0));
+            start_pubkey_writer(); // Initialize the buffering system
             break;
         case 'q':
             FLAGQUIET = 1;
@@ -2450,11 +2489,13 @@ int main(int argc, char **argv)
                 {
                     if (FLAGMATRIX)
                     {
-                        sprintf(buffer, "[+] Total %s keys in %s seconds: %s keys/s\n", str_total, str_seconds, str_pretotal);
+                        sprintf(buffer, "[+] Total %s keys in %s seconds: %s keys/s | Pubkeys written: %llu\n",
+                                str_total, str_seconds, str_pretotal, total_keys_written);
                     }
                     else
                     {
-                        sprintf(buffer, "\r[+] Total %s keys in %s seconds: %s keys/s\r", str_total, str_seconds, str_pretotal);
+                        sprintf(buffer, "\r[+] Total %s keys in %s seconds: %s keys/s | Pubkeys written: %llu\r",
+                                str_total, str_seconds, str_pretotal, total_keys_written);
                     }
                 }
                 else
@@ -2478,17 +2519,23 @@ int main(int argc, char **argv)
                     str_divpretotal = div_pretotal.GetBase10();
                     if (FLAGMATRIX)
                     {
-                        sprintf(buffer, "[+] Total %s keys in %s seconds: ~%s %s (%s keys/s)\n", str_total, str_seconds, str_divpretotal, str_limits_prefixs[salir ? i : i - 1], str_pretotal);
+                        sprintf(buffer, "[+] Total %s keys in %s seconds: ~%s %s (%s keys/s) | Pubkeys written: %llu\n",
+                                str_total, str_seconds, str_divpretotal, str_limits_prefixs[salir ? i : i - 1],
+                                str_pretotal, total_keys_written);
                     }
                     else
                     {
                         if (THREADOUTPUT == 1)
                         {
-                            sprintf(buffer, "\r[+] Total %s keys in %s seconds: ~%s %s (%s keys/s)\r", str_total, str_seconds, str_divpretotal, str_limits_prefixs[salir ? i : i - 1], str_pretotal);
+                            sprintf(buffer, "\r[+] Total %s keys in %s seconds: ~%s %s (%s keys/s) | Pubkeys written: %llu\r",
+                                    str_total, str_seconds, str_divpretotal, str_limits_prefixs[salir ? i : i - 1],
+                                    str_pretotal, total_keys_written);
                         }
                         else
                         {
-                            sprintf(buffer, "\r[+] Total %s keys in %s seconds: ~%s %s (%s keys/s)\r", str_total, str_seconds, str_divpretotal, str_limits_prefixs[salir ? i : i - 1], str_pretotal);
+                            sprintf(buffer, "\r[+] Total %s keys in %s seconds: ~%s %s (%s keys/s) | Pubkeys written: %llu\r",
+                                    str_total, str_seconds, str_divpretotal, str_limits_prefixs[salir ? i : i - 1],
+                                    str_pretotal, total_keys_written);
                         }
                     }
                     free(str_divpretotal);
@@ -2615,6 +2662,218 @@ int main(int argc, char **argv)
     delete secp;
 
     return 0;
+}
+
+void init_pubkey_buffers()
+{
+    thread_buffers = (PubkeyBuffer *)calloc(NUM_BUFFERS, sizeof(PubkeyBuffer));
+    for (int i = 0; i < NUM_BUFFERS; i++)
+    {
+        thread_buffers[i].keys = (unsigned char *)malloc(PUBKEY_BUFFER_SIZE * 33);
+        thread_buffers[i].count = 0;
+        thread_buffers[i].ready = false;
+
+#if defined(_WIN64) && !defined(__CYGWIN__)
+        thread_buffers[i].mutex = CreateMutex(NULL, FALSE, NULL);
+#else
+        pthread_mutex_init(&thread_buffers[i].mutex, NULL);
+#endif
+    }
+
+#if defined(_WIN64) && !defined(__CYGWIN__)
+    buffer_ready_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+#else
+    pthread_mutex_init(&buffer_ready_mutex, NULL);
+    pthread_cond_init(&buffer_ready_cond, NULL);
+#endif
+}
+
+// Writer thread function
+#if defined(_WIN64) && !defined(__CYGWIN__)
+DWORD WINAPI writer_thread_func(LPVOID vargp)
+{
+#else
+void *writer_thread_func(void *vargp)
+{
+#endif
+    while (writer_running || total_keys_written < max_pubkeys_to_generate)
+    {
+        bool found_buffer = false;
+
+        // Check all buffers for ready data
+        for (int i = 0; i < NUM_BUFFERS && total_keys_written < max_pubkeys_to_generate; i++)
+        {
+#if defined(_WIN64) && !defined(__CYGWIN__)
+            WaitForSingleObject(thread_buffers[i].mutex, INFINITE);
+#else
+            pthread_mutex_lock(&thread_buffers[i].mutex);
+#endif
+
+            if (thread_buffers[i].ready)
+            {
+                // Write the entire buffer at once
+                if (thread_buffers[i].count > 0)
+                {
+                    size_t keys_to_write = thread_buffers[i].count;
+                    if (total_keys_written + keys_to_write > max_pubkeys_to_generate)
+                    {
+                        keys_to_write = max_pubkeys_to_generate - total_keys_written;
+                    }
+
+                    fwrite(thread_buffers[i].keys, 33, keys_to_write, pubkeyfile);
+                    total_keys_written += keys_to_write;
+                }
+
+                thread_buffers[i].count = 0;
+                thread_buffers[i].ready = false;
+                found_buffer = true;
+            }
+
+#if defined(_WIN64) && !defined(__CYGWIN__)
+            ReleaseMutex(thread_buffers[i].mutex);
+#else
+            pthread_mutex_unlock(&thread_buffers[i].mutex);
+#endif
+
+            if (total_keys_written >= max_pubkeys_to_generate)
+            {
+                printf("\n[+] Generated %llu public keys. Stopping as requested.\n", total_keys_written);
+                fclose(pubkeyfile);
+                writer_running = false;
+                return NULL;
+            }
+        }
+
+        if (!found_buffer && writer_running)
+        {
+#if defined(_WIN64) && !defined(__CYGWIN__)
+            WaitForSingleObject(buffer_ready_event, 100);
+            ResetEvent(buffer_ready_event);
+#else
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_nsec += 100000000; // 100ms
+            pthread_mutex_lock(&buffer_ready_mutex);
+            pthread_cond_timedwait(&buffer_ready_cond, &buffer_ready_mutex, &ts);
+            pthread_mutex_unlock(&buffer_ready_mutex);
+#endif
+        }
+    }
+    return NULL;
+}
+
+void add_pubkey_to_buffer(const unsigned char *pubkey, int thread_id)
+{
+    if (total_keys_written >= max_pubkeys_to_generate)
+        return;
+
+    PubkeyBuffer *buffer = &thread_buffers[thread_id];
+
+#if defined(_WIN64) && !defined(__CYGWIN__)
+    WaitForSingleObject(buffer->mutex, INFINITE);
+#else
+    pthread_mutex_lock(&buffer->mutex);
+#endif
+
+    if (buffer->count < PUBKEY_BUFFER_SIZE)
+    {
+        memcpy(buffer->keys + (buffer->count * 33), pubkey, 33);
+        buffer->count++;
+
+        if (buffer->count >= PUBKEY_BUFFER_SIZE)
+        {
+            buffer->ready = true;
+#if defined(_WIN64) && !defined(__CYGWIN__)
+            SetEvent(buffer_ready_event);
+#else
+            pthread_mutex_lock(&buffer_ready_mutex);
+            pthread_cond_signal(&buffer_ready_cond);
+            pthread_mutex_unlock(&buffer_ready_mutex);
+#endif
+        }
+    }
+
+#if defined(_WIN64) && !defined(__CYGWIN__)
+    ReleaseMutex(buffer->mutex);
+#else
+    pthread_mutex_unlock(&buffer->mutex);
+#endif
+}
+
+void start_pubkey_writer()
+{
+    init_pubkey_buffers();
+
+#if defined(_WIN64) && !defined(__CYGWIN__)
+    writer_thread = CreateThread(NULL, 0, writer_thread_func, NULL, 0, NULL);
+    if (writer_thread == NULL)
+    {
+        fprintf(stderr, "Error creating writer thread\n");
+        exit(EXIT_FAILURE);
+    }
+#else
+    if (pthread_create(&writer_thread, NULL, writer_thread_func, NULL) != 0)
+    {
+        fprintf(stderr, "Error creating writer thread\n");
+        exit(EXIT_FAILURE);
+    }
+#endif
+}
+
+void cleanup_pubkey_writer()
+{
+    writer_running = false;
+
+#if defined(_WIN64) && !defined(__CYGWIN__)
+    SetEvent(buffer_ready_event);
+    WaitForSingleObject(writer_thread, INFINITE);
+    CloseHandle(writer_thread);
+    CloseHandle(buffer_ready_event);
+#else
+    pthread_mutex_lock(&buffer_ready_mutex);
+    pthread_cond_signal(&buffer_ready_cond);
+    pthread_mutex_unlock(&buffer_ready_mutex);
+    pthread_join(writer_thread, NULL);
+    pthread_mutex_destroy(&buffer_ready_mutex);
+    pthread_cond_destroy(&buffer_ready_cond);
+#endif
+
+    // Clean up thread buffers
+    if (thread_buffers)
+    {
+        for (int i = 0; i < NUM_BUFFERS; i++)
+        {
+            if (thread_buffers[i].count > 0)
+            {
+                // Write any remaining keys
+                size_t keys_to_write = thread_buffers[i].count;
+                if (total_keys_written + keys_to_write > max_pubkeys_to_generate)
+                {
+                    keys_to_write = max_pubkeys_to_generate - total_keys_written;
+                }
+                if (keys_to_write > 0)
+                {
+                    fwrite(thread_buffers[i].keys, 33, keys_to_write, pubkeyfile);
+                    total_keys_written += keys_to_write;
+                }
+            }
+
+            free(thread_buffers[i].keys);
+#if defined(_WIN64) && !defined(__CYGWIN__)
+            CloseHandle(thread_buffers[i].mutex);
+#else
+            pthread_mutex_destroy(&thread_buffers[i].mutex);
+#endif
+        }
+        free(thread_buffers);
+        thread_buffers = NULL;
+    }
+
+    if (pubkeyfile)
+    {
+        fclose(pubkeyfile);
+        pubkeyfile = NULL;
+    }
 }
 
 void pubkeytopubaddress_dst(char *pkey, int length, char *dst)
@@ -2931,7 +3190,6 @@ void *thread_process(void *vargp)
     char publickeyhashrmd160[20];
     char publickeyhashrmd160_uncompress[4][20];
     char rawvalue[32];
-
     char publickeyhashrmd160_endomorphism[12][4][20];
 
     bool calculate_y = FLAGSEARCH == SEARCH_UNCOMPRESS || FLAGSEARCH == SEARCH_BOTH || FLAGCRYPTO == CRYPTO_ETH;
@@ -2968,6 +3226,7 @@ void *thread_process(void *vargp)
                 continue_flag = 0;
             }
         }
+
         if (continue_flag)
         {
             count = 0;
@@ -2989,6 +3248,7 @@ void *thread_process(void *vargp)
                     THREADOUTPUT = 1;
                 }
             }
+
             do
             {
                 temp_stride.SetInt32(CPU_GRP_SIZE / 2);
@@ -3170,41 +3430,8 @@ void *thread_process(void *vargp)
                                     secp->GetHash160(P2PKH, false, pts[(j * 4)], pts[(j * 4) + 1], pts[(j * 4) + 2], pts[(j * 4) + 3], (uint8_t *)publickeyhashrmd160_uncompress[0], (uint8_t *)publickeyhashrmd160_uncompress[1], (uint8_t *)publickeyhashrmd160_uncompress[2], (uint8_t *)publickeyhashrmd160_uncompress[3]);
                                 }
                             }
-                        }
-                        else if (FLAGCRYPTO == CRYPTO_ETH)
-                        {
-                            if (FLAGENDOMORPHISM)
-                            {
-                                for (k = 0; k < 4; k++)
-                                {
-                                    endomorphism_negeted_point[k] = secp->Negation(pts[(j * 4) + k]);
-                                    generate_binaddress_eth(pts[(4 * j) + k], (uint8_t *)publickeyhashrmd160_endomorphism[0][k]);
-                                    generate_binaddress_eth(endomorphism_negeted_point[k], (uint8_t *)publickeyhashrmd160_endomorphism[1][k]);
-                                    endomorphism_negeted_point[k] = secp->Negation(endomorphism_beta[(j * 4) + k]);
-                                    generate_binaddress_eth(endomorphism_beta[(4 * j) + k], (uint8_t *)publickeyhashrmd160_endomorphism[2][k]);
-                                    generate_binaddress_eth(endomorphism_negeted_point[k], (uint8_t *)publickeyhashrmd160_endomorphism[3][k]);
-                                    endomorphism_negeted_point[k] = secp->Negation(endomorphism_beta2[(j * 4) + k]);
-                                    generate_binaddress_eth(endomorphism_beta[(4 * j) + k], (uint8_t *)publickeyhashrmd160_endomorphism[4][k]);
-                                    generate_binaddress_eth(endomorphism_negeted_point[k], (uint8_t *)publickeyhashrmd160_endomorphism[5][k]);
-                                }
-                            }
-                            else
-                            {
-                                for (k = 0; k < 4; k++)
-                                {
-                                    generate_binaddress_eth(pts[(4 * j) + k], (uint8_t *)publickeyhashrmd160_uncompress[k]);
-                                }
-                            }
-                        }
-                        break;
-                    }
 
-                    switch (FLAGMODE)
-                    {
-                    case MODE_RMD160:
-                    case MODE_ADDRESS:
-                        if (FLAGCRYPTO == CRYPTO_BTC)
-                        {
+                            // Check all the generated hashes for matches
                             for (k = 0; k < 4; k++)
                             {
                                 if (FLAGSEARCH == SEARCH_COMPRESS || FLAGSEARCH == SEARCH_BOTH)
@@ -3227,14 +3454,14 @@ void *thread_process(void *vargp)
                                                     {
                                                     case 0: // Original point, prefix 02
                                                         if (publickey.y.IsOdd())
-                                                        { // if the current publickey is odd that means, we need to negate the keyfound to get the correct key
+                                                        {
                                                             keyfound.Neg();
                                                             keyfound.Add(&secp->order);
                                                         }
                                                         break;
                                                     case 1: // Original point, prefix 03
                                                         if (publickey.y.IsEven())
-                                                        { // if the current publickey is even that means, we need to negate the keyfound to get the correct key
+                                                        {
                                                             keyfound.Neg();
                                                             keyfound.Add(&secp->order);
                                                         }
@@ -3242,7 +3469,7 @@ void *thread_process(void *vargp)
                                                     case 2: // Beta point, prefix 02
                                                         keyfound.ModMulK1order(&lambda);
                                                         if (publickey.y.IsOdd())
-                                                        { // if the current publickey is odd that means, we need to negate the keyfound to get the correct key
+                                                        {
                                                             keyfound.Neg();
                                                             keyfound.Add(&secp->order);
                                                         }
@@ -3250,7 +3477,7 @@ void *thread_process(void *vargp)
                                                     case 3: // Beta point, prefix 03
                                                         keyfound.ModMulK1order(&lambda);
                                                         if (publickey.y.IsEven())
-                                                        { // if the current publickey is even that means, we need to negate the keyfound to get the correct key
+                                                        {
                                                             keyfound.Neg();
                                                             keyfound.Add(&secp->order);
                                                         }
@@ -3258,7 +3485,7 @@ void *thread_process(void *vargp)
                                                     case 4: // Beta^2 point, prefix 02
                                                         keyfound.ModMulK1order(&lambda2);
                                                         if (publickey.y.IsOdd())
-                                                        { // if the current publickey is odd that means, we need to negate the keyfound to get the correct key
+                                                        {
                                                             keyfound.Neg();
                                                             keyfound.Add(&secp->order);
                                                         }
@@ -3266,7 +3493,7 @@ void *thread_process(void *vargp)
                                                     case 5: // Beta^2 point, prefix 03
                                                         keyfound.ModMulK1order(&lambda2);
                                                         if (publickey.y.IsEven())
-                                                        { // if the current publickey is even that means, we need to negate the keyfound to get the correct key
+                                                        {
                                                             keyfound.Neg();
                                                             keyfound.Add(&secp->order);
                                                         }
@@ -3310,11 +3537,11 @@ void *thread_process(void *vargp)
                                     if (FLAGENDOMORPHISM)
                                     {
                                         for (l = 6; l < 12; l++)
-                                        {                                                                                      // We check the array from 6 to 12(excluded) because we save the uncompressed information there
-                                            r = bloom_check(&bloom, publickeyhashrmd160_endomorphism[l][k], MAXLENGTHADDRESS); // Check in Bloom filter
+                                        {
+                                            r = bloom_check(&bloom, publickeyhashrmd160_endomorphism[l][k], MAXLENGTHADDRESS);
                                             if (r)
                                             {
-                                                r = searchbinary(addressTable, publickeyhashrmd160_endomorphism[l][k], N); // Check in Array using Binary search
+                                                r = searchbinary(addressTable, publickeyhashrmd160_endomorphism[l][k], N);
                                                 if (r)
                                                 {
                                                     keyfound.SetInt32(k);
@@ -3378,8 +3605,8 @@ void *thread_process(void *vargp)
                                 }
                             }
 
-                            // Save compressed public keys if FLAGPRINTPUBKEYS is set
-                            if (FLAGPRINTPUBKEYS)
+                            // Save compressed public keys using the new buffering system if FLAGPRINTPUBKEYS is set
+                            if (FLAGPRINTPUBKEYS && thread_buffers != NULL)
                             {
                                 for (k = 0; k < 4; k++)
                                 {
@@ -3392,38 +3619,39 @@ void *thread_process(void *vargp)
 
                                     // Create 33-byte binary public key
                                     unsigned char binPubKey[33];
-                                    // Set first byte based on Y coordinate (0x02 for even, 0x03 for odd)
                                     binPubKey[0] = publicKey.y.IsEven() ? 0x02 : 0x03;
-                                    // Get the 32 bytes of X coordinate
                                     publicKey.x.Get32Bytes(binPubKey + 1);
 
-#if defined(_WIN64) && !defined(__CYGWIN__)
-                                    WaitForSingleObject(write_keys, INFINITE);
-#else
-                                    pthread_mutex_lock(&write_keys);
-#endif
-
-                                    // Write the 33 bytes directly to file
-                                    fwrite(binPubKey, 1, 33, pubkeyfile);
-                                    pubkeys_generated++;
-
-                                    if (pubkeys_generated >= max_pubkeys_to_generate)
-                                    {
-                                        printf("\n[+] Generated %llu public keys. Stopping as requested.\n", pubkeys_generated);
-                                        fclose(pubkeyfile);
-                                        exit(EXIT_SUCCESS);
-                                    }
-
-#if defined(_WIN64) && !defined(__CYGWIN__)
-                                    ReleaseMutex(write_keys);
-#else
-                                    pthread_mutex_unlock(&write_keys);
-#endif
+                                    // Add to thread's buffer
+                                    add_pubkey_to_buffer(binPubKey, thread_number);
                                 }
                             }
                         }
                         else if (FLAGCRYPTO == CRYPTO_ETH)
                         {
+                            if (FLAGENDOMORPHISM)
+                            {
+                                for (k = 0; k < 4; k++)
+                                {
+                                    endomorphism_negeted_point[k] = secp->Negation(pts[(j * 4) + k]);
+                                    generate_binaddress_eth(pts[(4 * j) + k], (uint8_t *)publickeyhashrmd160_endomorphism[0][k]);
+                                    generate_binaddress_eth(endomorphism_negeted_point[k], (uint8_t *)publickeyhashrmd160_endomorphism[1][k]);
+                                    endomorphism_negeted_point[k] = secp->Negation(endomorphism_beta[(j * 4) + k]);
+                                    generate_binaddress_eth(endomorphism_beta[(4 * j) + k], (uint8_t *)publickeyhashrmd160_endomorphism[2][k]);
+                                    generate_binaddress_eth(endomorphism_negeted_point[k], (uint8_t *)publickeyhashrmd160_endomorphism[3][k]);
+                                    endomorphism_negeted_point[k] = secp->Negation(endomorphism_beta2[(j * 4) + k]);
+                                    generate_binaddress_eth(endomorphism_beta[(4 * j) + k], (uint8_t *)publickeyhashrmd160_endomorphism[4][k]);
+                                    generate_binaddress_eth(endomorphism_negeted_point[k], (uint8_t *)publickeyhashrmd160_endomorphism[5][k]);
+                                }
+                            }
+                            else
+                            {
+                                for (k = 0; k < 4; k++)
+                                {
+                                    generate_binaddress_eth(pts[(4 * j) + k], (uint8_t *)publickeyhashrmd160_uncompress[k]);
+                                }
+                            }
+
                             if (FLAGENDOMORPHISM)
                             {
                                 for (k = 0; k < 4; k++)
@@ -3499,8 +3727,8 @@ void *thread_process(void *vargp)
                                 }
                             }
 
-                            // Save compressed public keys if FLAGPRINTPUBKEYS is set
-                            if (FLAGPRINTPUBKEYS)
+                            // Save public keys if FLAGPRINTPUBKEYS is set - using buffering system
+                            if (FLAGPRINTPUBKEYS && thread_buffers != NULL)
                             {
                                 for (k = 0; k < 4; k++)
                                 {
@@ -3513,33 +3741,11 @@ void *thread_process(void *vargp)
 
                                     // Create 33-byte binary public key
                                     unsigned char binPubKey[33];
-                                    // Set first byte based on Y coordinate (0x02 for even, 0x03 for odd)
                                     binPubKey[0] = publicKey.y.IsEven() ? 0x02 : 0x03;
-                                    // Get the 32 bytes of X coordinate
                                     publicKey.x.Get32Bytes(binPubKey + 1);
 
-#if defined(_WIN64) && !defined(__CYGWIN__)
-                                    WaitForSingleObject(write_keys, INFINITE);
-#else
-                                    pthread_mutex_lock(&write_keys);
-#endif
-
-                                    // Write the 33 bytes directly to file
-                                    fwrite(binPubKey, 1, 33, pubkeyfile);
-                                    pubkeys_generated++;
-
-                                    if (pubkeys_generated >= max_pubkeys_to_generate)
-                                    {
-                                        printf("\n[+] Generated %llu public keys. Stopping as requested.\n", pubkeys_generated);
-                                        fclose(pubkeyfile);
-                                        exit(EXIT_SUCCESS);
-                                    }
-
-#if defined(_WIN64) && !defined(__CYGWIN__)
-                                    ReleaseMutex(write_keys);
-#else
-                                    pthread_mutex_unlock(&write_keys);
-#endif
+                                    // Add to thread's buffer
+                                    add_pubkey_to_buffer(binPubKey, thread_number);
                                 }
                             }
                         }
