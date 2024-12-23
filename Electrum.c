@@ -11,21 +11,25 @@
 
 void start_electrum_daemon()
 {
-    char cmd[256];
-    // Use python3 to run the Electrum commands
-    snprintf(cmd, sizeof(cmd), "cd ../Electrum-4.4.6 && python3 -m electrum daemon -d");
+    char cmd[512];
+    // Kill any existing Electrum processes first
+    system("pkill -f electrum");
+    sleep(1);
+    
+    // Use absolute paths
+    snprintf(cmd, sizeof(cmd), "cd /root/Electrum-4.4.6 && PYTHONPATH=/root/Electrum-4.4.6 python3 -m electrum daemon -d");
     system(cmd);
     sleep(2);
     
-    snprintf(cmd, sizeof(cmd), "cd ../Electrum-4.4.6 && python3 -m electrum daemon setconfig rpcport 7777");
+    snprintf(cmd, sizeof(cmd), "cd /root/Electrum-4.4.6 && PYTHONPATH=/root/Electrum-4.4.6 python3 -m electrum daemon setconfig rpcport 7777");
     system(cmd);
     
-    snprintf(cmd, sizeof(cmd), "cd ../Electrum-4.4.6 && python3 -m electrum daemon load_wallet");
+    snprintf(cmd, sizeof(cmd), "cd /root/Electrum-4.4.6 && PYTHONPATH=/root/Electrum-4.4.6 python3 -m electrum daemon load_wallet");
     system(cmd);
     sleep(1);
 
     // Verify daemon is running
-    snprintf(cmd, sizeof(cmd), "cd ../Electrum-4.4.6 && python3 -m electrum daemon status");
+    snprintf(cmd, sizeof(cmd), "cd /root/Electrum-4.4.6 && PYTHONPATH=/root/Electrum-4.4.6 python3 -m electrum daemon status");
     system(cmd);
 }
 
