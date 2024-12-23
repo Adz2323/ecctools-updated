@@ -24,7 +24,7 @@ std::string exec(const char* cmd) {
 }
 
 std::string runKeydivision(std::string& linePrivKey) {
-    std::string cmd = "./Auto -f scanned_pubkeys.bin -b 160 -t 2 "
+    std::string cmd = "./Auto -f scanned_pubkeys.bin -b 160 -t 32 "
                      "02145d2611c823a396ef6712ce0f712f09b9b4f3135e3e0aa3230fb9b6d08d1e16 "
                      "02e0a8b039282faf6fe0fd769cfbc4b6b4cf8758ba68220eac420e32b91ddfa673 "
                      "035cd1854cae45391ca4ec428cc7e6c7d9984424b954209a8eea197b9e364c05f6 "
