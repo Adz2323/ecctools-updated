@@ -34,7 +34,7 @@ check_status "System dependencies installation"
 
 # Compile the programs
 echo "Compiling Electrum..."
-gcc electrum.c -o Electrum -lcurl -ljson-c -lgmp -lgcrypt -lssl
+gcc Electrum.c -o Electrum -lcurl -ljson-c -lgmp -lgcrypt -lssl
 check_status "Electrum compilation"
 
 echo "Compiling Run..."
