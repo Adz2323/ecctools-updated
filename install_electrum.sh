@@ -15,23 +15,33 @@ check_status() {
     fi
 }
 
-# Update package list
-echo "Updating package list..."
-sudo apt-get update
-check_status "Package list update"
+# Update system
+echo "Updating system packages..."
+sudo apt update && sudo apt upgrade -y
+check_status "System update"
 
 # Install system dependencies
 echo "Installing system dependencies..."
 sudo apt-get install -y \
+    root-repo \
+    git \
+    build-essential \
+    libssl-dev \
+    libgcrypt20-dev \
+    libgmp-dev \
+    libjson-c-dev \
+    libcurl4-openssl-dev \
+    python3-pip \
+    automake \
+    autoconf \
+    libtool \
     libsecp256k1-dev \
     python3-setuptools \
-    python3-pip \
     python3-pyqt6 \
     python3-cryptography \
     python3-requests \
     gettext \
-    qttools5-dev-tools \
-    git
+    qttools5-dev-tools
 check_status "System dependencies installation"
 
 # Create a directory for Electrum
