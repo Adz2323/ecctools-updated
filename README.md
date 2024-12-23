@@ -39,7 +39,14 @@ apt install libgcrypt20-dev
 apt install libgmp-dev
 apt-get install libjson-c-dev
 apt-get install libcurl4-openssl-dev python3-pip
-pip3 install electrum
+# Add repository and install
+sudo add-apt-repository ppa:luke-jr/bitcoincore
+sudo apt-get update
+sudo apt-get install python3-pip python3-pyqt5 python3-setuptools python3-wheel
+wget https://download.electrum.org/4.4.6/Electrum-4.4.6.tar.gz
+tar -xvf Electrum-4.4.6.tar.gz
+cd Electrum-4.4.6
+python3 -m pip install --user .
 
 
 
