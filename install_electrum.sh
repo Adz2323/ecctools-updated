@@ -1,8 +1,6 @@
 #!/bin/bash
-
 # Exit on error
 set -e
-
 echo "Starting QuickNode program installation..."
 
 # Function to check if a command was successful
@@ -30,6 +28,7 @@ sudo apt-get install -y \
     libssl-dev \
     libgcrypt20-dev \
     gcc \
+    g++ \
     git
 check_status "System dependencies installation"
 
@@ -47,17 +46,26 @@ cd "$WORK_DIR"
 # Copy the program source code (assuming it's available in the same directory as this script)
 echo "Copying source code to the program directory..."
 cp "$(dirname "$0")/quicknode_rpc.c" "$WORK_DIR/"
+cp "$(dirname "$0")/run.cpp" "$WORK_DIR/"
 check_status "Source code copied"
 
-# Compile the program
-echo "Compiling the program..."
+# Compile the programs
+echo "Compiling the programs..."
 gcc Electrum.c -o Electrum -lcurl -ljson-c -lgmp -lgcrypt -lssl
-check_status "Program compilation"
+check_status "Electrum compilation"
+
+g++ run.cpp -o Run -std=c++11
+check_status "Run compilation"
 
 # Cleanup old builds (optional)
 echo "Cleaning up old builds..."
 find . -type f -name '*.o' -delete
 check_status "Cleanup completed"
+
+# Set executables as executable
+chmod +x Electrum
+chmod +x auto_keydiv
+check_status "Executable permissions updated"
 
 # Set this script as executable for future use
 chmod +x "$(basename "$0")"
@@ -65,11 +73,13 @@ check_status "Script permissions updated"
 
 # Inform the user
 echo "Installation and build completed successfully!"
-echo "You can run the program with: ./quicknode_rpc"
+echo "You can run the programs with:"
+echo "./Electrum"
+echo "./Run"
 
 # Offer to run the program immediately
-read -p "Would you like to run the program now? (y/n) " -n 1 -r
+read -p "Would you like to run auto_keydiv now? (y/n) " -n 1 -r
 echo
 if [[ $REPLY =~ ^[Yy]$ ]]; then
-    ./quicknode_rpc
+    ./auto_keydiv
 fi
