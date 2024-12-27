@@ -38,6 +38,11 @@ const char *VERSION = "1.0.0";
 #define COMPRESSED_PUBKEY_SIZE 33 // Size of binary compressed pubkey
 #define HEX_PUBKEY_SIZE 66        // Size of hex string pubkey without null terminator
 
+// Auto subtraction settings
+mpz_t auto_subtraction_value;
+uint64_t auto_subtraction_count = 0;
+bool auto_subtraction_mode = false;
+
 // Thread management
 #define MAX_THREADS 256
 #define THREAD_SLEEP_MICROSECONDS 100
@@ -101,12 +106,15 @@ struct DivisionControl
 struct thread_args
 {
     struct Point *start_pubkeys;
-    int num_pubkeys;
-    int target_bit;
     int thread_id;
     char **initial_pks;
-    struct DivisionControl *div_ctrl;
-    struct PerformanceMetrics *metrics;
+    uint64_t start_index;
+    uint64_t end_index;
+    bool auto_subtraction;
+    int num_pubkeys;                    // needed for other modes
+    int target_bit;                     // needed for other modes
+    struct DivisionControl *div_ctrl;   // needed for other modes
+    struct PerformanceMetrics *metrics; // needed for other modes
 };
 
 struct bloom_load_worker
@@ -887,6 +895,83 @@ void *find_division_path_thread(void *arg)
     return NULL;
 }
 
+void *auto_subtract_points_thread(void *arg)
+{
+    struct thread_args *args = (struct thread_args *)arg;
+    struct Point current_point, G_mult, temp_point, result_point;
+    char current_pk[132];
+    uint64_t start = args->start_index;
+    uint64_t end = args->end_index;
+
+    mpz_init_set(current_point.x, args->start_pubkeys->x);
+    mpz_init_set(current_point.y, args->start_pubkeys->y);
+    mpz_init(G_mult.x);
+    mpz_init(G_mult.y);
+    mpz_init(temp_point.x);
+    mpz_init(temp_point.y);
+    mpz_init(result_point.x);
+    mpz_init(result_point.y);
+
+    if (start > 0)
+    {
+        mpz_t offset_scalar;
+        mpz_init(offset_scalar);
+        mpz_set_ui(offset_scalar, start);
+        mpz_mul(offset_scalar, offset_scalar, auto_subtraction_value);
+
+        Scalar_Multiplication(G, &G_mult, offset_scalar);
+        Point_Negation(&G_mult, &temp_point);
+        Point_Addition(&current_point, &temp_point, &result_point);
+
+        mpz_set(current_point.x, result_point.x);
+        mpz_set(current_point.y, result_point.y);
+
+        mpz_clear(offset_scalar);
+    }
+
+    for (uint64_t i = start; i < end; i++)
+    {
+        generate_strpublickey(&current_point, true, current_pk);
+
+        if (i % 100 == 0)
+        {
+            printf("\rThread %d: %lu/%lu (%.2f%%) Current PK: %.66s",
+                   args->thread_id, i - start, end - start,
+                   ((double)(i - start) / (end - start)) * 100,
+                   current_pk);
+            fflush(stdout);
+        }
+
+        if (bloom_initialized1 && triple_bloom_check(current_pk))
+        {
+            pthread_mutex_lock(&print_mutex);
+            printf("\nMatch found! Thread %d at subtraction %lu\n", args->thread_id, i);
+            printf("Original: %s\n", *args->initial_pks);
+            printf("Found Public Key: %s\n", current_pk);
+            pthread_mutex_unlock(&print_mutex);
+            break;
+        }
+
+        Scalar_Multiplication(G, &G_mult, auto_subtraction_value);
+        Point_Negation(&G_mult, &temp_point);
+        Point_Addition(&current_point, &temp_point, &result_point);
+
+        mpz_set(current_point.x, result_point.x);
+        mpz_set(current_point.y, result_point.y);
+    }
+
+    mpz_clear(current_point.x);
+    mpz_clear(current_point.y);
+    mpz_clear(G_mult.x);
+    mpz_clear(G_mult.y);
+    mpz_clear(temp_point.x);
+    mpz_clear(temp_point.y);
+    mpz_clear(result_point.x);
+    mpz_clear(result_point.y);
+
+    return NULL;
+}
+
 // Estimates the size of a bloom filter in bytes
 uint64_t estimate_bloom_size(uint64_t items, double fp_rate)
 {
@@ -1349,20 +1434,16 @@ void Scalar_Multiplication_custom(struct Point P, struct Point *R, mpz_t m)
     mpz_clear(T.y);
 }
 
-// Main function
 int main(int argc, char **argv)
 {
-    // Initialize Random
     rseed(time(NULL));
 
-    // Initialize elliptic curve constants
     mpz_init_set_str(EC.p, EC_constant_P, 16);
     mpz_init_set_str(EC.n, EC_constant_N, 16);
     mpz_init_set_str(G.x, EC_constant_Gx, 16);
     mpz_init_set_str(G.y, EC_constant_Gy, 16);
     init_doublingG(&G);
 
-    // Initialize points for single operations
     struct Point A, B, C;
     mpz_init_set_ui(A.x, 0);
     mpz_init_set_ui(A.y, 0);
@@ -1377,7 +1458,6 @@ int main(int argc, char **argv)
     bool FLAG_NUMBER = false;
     char str_publickey[132];
 
-    // Initialize performance metrics
     struct PerformanceMetrics metrics;
     initialize_performance_metrics(&metrics);
 
@@ -1386,10 +1466,17 @@ int main(int argc, char **argv)
     int target_bit = 0;
     int num_threads = 1;
 
-    while ((opt = getopt(argc, argv, "f:b:st:d")) != -1)
+    while ((opt = getopt(argc, argv, "f:b:st:d:a:n:")) != -1)
     {
         switch (opt)
         {
+        case 'a':
+            auto_subtraction_mode = true;
+            mpz_init_set_str(auto_subtraction_value, optarg, 10);
+            break;
+        case 'n':
+            auto_subtraction_count = strtoull(optarg, NULL, 10);
+            break;
         case 'd':
             debug_mode = true;
             break;
@@ -1410,11 +1497,11 @@ int main(int argc, char **argv)
                 num_threads = MAX_THREADS;
             break;
         default:
-            printf("Usage: %s [-f bloom_file] [-b target_bit] [-t threads] [-s] <pubkey1> [operation] [pubkey2/number]\n", argv[0]);
+            printf("Usage: %s [-f bloom_file] [-b target_bit] [-t threads] [-s] [-a subtraction_value] [-n count] <pubkey>\n", argv[0]);
             printf("Operations:\n");
             printf("  Normal mode: <pubkey1> [+|-|x|/] <pubkey2/number>\n");
+            printf("  Auto subtraction mode: -f <bloom_file> -a <value> -n <count> <pubkey>\n");
             printf("  Division path mode: -b <target_bit> <pubkey1> [pubkey2...]\n");
-            printf("  Optional: -f <bloom_filter_file> to check against known public keys\n");
             exit(1);
         }
     }
@@ -1434,6 +1521,71 @@ int main(int argc, char **argv)
         exit(1);
     }
 
+    // Auto subtraction mode
+    if (auto_subtraction_mode)
+    {
+        if (!bloom_file)
+        {
+            printf("Error: Bloom filter (-f) required for auto subtraction mode\n");
+            exit(1);
+        }
+        if (auto_subtraction_count == 0)
+        {
+            printf("Error: Number of subtractions (-n) required\n");
+            exit(1);
+        }
+
+        struct Point start_point;
+        mpz_init(start_point.x);
+        mpz_init(start_point.y);
+        set_publickey(argv[0], &start_point);
+
+        pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
+        struct thread_args *sub_args = malloc(num_threads * sizeof(struct thread_args));
+
+        // Calculate work distribution
+        uint64_t chunk_size = auto_subtraction_count / num_threads;
+        uint64_t remainder = auto_subtraction_count % num_threads;
+
+        printf("Starting auto subtraction with %d threads\n", num_threads);
+        printf("Total subtractions: %lu\n", auto_subtraction_count);
+        printf("Chunk size per thread: %lu\n", chunk_size);
+
+        for (int i = 0; i < num_threads; i++)
+        {
+            sub_args[i].start_pubkeys = &start_point;
+            sub_args[i].initial_pks = &argv[0];
+            sub_args[i].thread_id = i;
+
+            // Distribute remainder across threads
+            sub_args[i].start_index = i * chunk_size + (i < remainder ? i : remainder);
+            sub_args[i].end_index = (i + 1) * chunk_size + (i < remainder ? i + 1 : remainder);
+
+            if (pthread_create(&threads[i], NULL, auto_subtract_points_thread, &sub_args[i]) != 0)
+            {
+                printf("Failed to create thread %d\n", i);
+                exit(1);
+            }
+            printf("Thread %d searching range: %lu to %lu\n", i, sub_args[i].start_index, sub_args[i].end_index);
+        }
+
+        // Wait for all threads
+        for (int i = 0; i < num_threads; i++)
+        {
+            pthread_join(threads[i], NULL);
+        }
+
+        printf("\nCompleted auto subtraction search\n");
+
+        // Cleanup
+        free(threads);
+        free(sub_args);
+        mpz_clear(start_point.x);
+        mpz_clear(start_point.y);
+        cleanup_bloom_filters();
+        mpz_clear(auto_subtraction_value);
+        return 0;
+    }
     // Normal operation mode (non-threaded)
     if (target_bit == 0)
     {
@@ -1443,7 +1595,6 @@ int main(int argc, char **argv)
             exit(1);
         }
 
-        // Set first public key
         switch (strlen(argv[0]))
         {
         case 66:
@@ -1462,7 +1613,6 @@ int main(int argc, char **argv)
             exit(1);
         }
 
-        // Parse second argument
         switch (strlen(argv[2]))
         {
         case 66:
@@ -1489,7 +1639,6 @@ int main(int argc, char **argv)
 
         mpz_mod(number, number, EC.n);
 
-        // Perform operation
         switch (operation)
         {
         case '+':
@@ -1534,7 +1683,6 @@ int main(int argc, char **argv)
         generate_strpublickey(&C, true, str_publickey);
         printf("Result: %s\n\n", str_publickey);
     }
-    // Threading mode
     else
     {
         int num_pubkeys = argc;
@@ -1583,7 +1731,6 @@ int main(int argc, char **argv)
             pthread_join(threads[i], NULL);
         }
 
-        // Cleanup threading resources
         for (int i = 0; i < num_pubkeys; i++)
         {
             mpz_clear(pubkeys[i].x);
@@ -1598,7 +1745,6 @@ int main(int argc, char **argv)
         free(div_ctrl);
     }
 
-    // Final cleanup
     cleanup_bloom_filters();
     mpz_clear(EC.p);
     mpz_clear(EC.n);
@@ -1613,6 +1759,11 @@ int main(int argc, char **argv)
     mpz_clear(number);
     mpz_clear(inversemultiplier);
     pthread_mutex_destroy(&metrics.metrics_mutex);
+
+    if (auto_subtraction_mode)
+    {
+        mpz_clear(auto_subtraction_value);
+    }
 
     return 0;
 }
