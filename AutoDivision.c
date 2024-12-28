@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <signal.h>
 #include <gmp.h>
 #include <string.h>
 #include <unistd.h>
@@ -42,6 +43,11 @@ const char *VERSION = "1.0.0";
 mpz_t auto_subtraction_value;
 uint64_t auto_subtraction_count = 0;
 bool auto_subtraction_mode = false;
+uint64_t global_subtraction_count = 0;
+pthread_mutex_t subtraction_count_mutex = PTHREAD_MUTEX_INITIALIZER;
+#define CHECKPOINT_FILE "auto_subtraction_checkpoint.txt"
+#define CHECKPOINT_INTERVAL 1000 // Save checkpoint every 1000 subtractions
+struct thread_args *thread_args_array = NULL;
 
 // Thread management
 #define MAX_THREADS 256
@@ -58,6 +64,8 @@ bool auto_subtraction_mode = false;
 #define BLOOM3_FP_RATE 0.000001
 #define BUFFER_SIZE (1024 * 1024) // 1MB buffer
 #define WORKER_BATCH_SIZE 10000   // Number of entries per worker batch
+
+#define CHECKPOINT_FILE "auto_subtraction_checkpoint.txt"
 
 // Structure for storing compressed pubkeys
 struct CompressedPubKey
@@ -102,19 +110,20 @@ struct DivisionControl
     pthread_mutex_t mutex;
 };
 
-// Thread argument structure
 struct thread_args
 {
     struct Point *start_pubkeys;
     int thread_id;
     char **initial_pks;
+    char **current_pks; // Current public keys
     uint64_t start_index;
     uint64_t end_index;
     bool auto_subtraction;
-    int num_pubkeys;                    // needed for other modes
-    int target_bit;                     // needed for other modes
-    struct DivisionControl *div_ctrl;   // needed for other modes
-    struct PerformanceMetrics *metrics; // needed for other modes
+    int num_pubkeys;
+    int target_bit;
+    struct DivisionControl *div_ctrl;
+    struct PerformanceMetrics *metrics;
+    int num_threads;
 };
 
 struct bloom_load_worker
@@ -125,6 +134,13 @@ struct bloom_load_worker
     unsigned char *entries;
     size_t num_entries;
     bool is_binary;
+};
+
+struct CheckpointData
+{
+    uint64_t subtraction_count;
+    char **public_keys;
+    int num_keys;
 };
 
 // Global variables
@@ -181,6 +197,79 @@ bool is_binary_file(const char *filename);
 int read_pubkey_at_position(size_t pos, char *pubkey_hex);
 int64_t binary_search_pubkey(const char *target_pubkey);
 int init_search_file(const char *filename);
+void handle_interrupt(int sig);
+
+void handle_interrupt(int sig)
+{
+    pthread_mutex_lock(&print_mutex);
+    printf("\nReceived interrupt signal. Saving checkpoint...\n");
+
+    struct thread_args *args = &thread_args_array[0]; // Use thread 0's data
+
+    // Only try to save if thread 0's current_pks is initialized
+    if (args && args->current_pks)
+    {
+        FILE *checkpoint = fopen(CHECKPOINT_FILE, "w");
+        if (checkpoint)
+        {
+            // Save the global subtraction count first
+            fprintf(checkpoint, "%" PRIu64 "\n", global_subtraction_count);
+            fprintf(checkpoint, "Checkpoint Details:\n");
+            fprintf(checkpoint, "Total Subtractions: %" PRIu64 "\n", global_subtraction_count);
+            fprintf(checkpoint, "Current Public Keys:\n");
+
+            // Safely save each public key
+            for (int i = 0; i < args->num_pubkeys; i++)
+            {
+                if (args->current_pks[i])
+                {
+                    fprintf(checkpoint, "%s\n", args->current_pks[i]);
+                }
+            }
+
+            fclose(checkpoint);
+            printf("Checkpoint saved. Progress: %" PRIu64 " subtractions\n", global_subtraction_count);
+            printf("Current public keys saved\n");
+        }
+        else
+        {
+            printf("Error: Could not save checkpoint file\n");
+        }
+    }
+    else
+    {
+        // Fallback: save just the count if keys aren't available
+        FILE *checkpoint = fopen(CHECKPOINT_FILE, "w");
+        if (checkpoint)
+        {
+            fprintf(checkpoint, "%" PRIu64 "\n", global_subtraction_count);
+            fclose(checkpoint);
+            printf("Checkpoint saved (count only): %" PRIu64 " subtractions\n", global_subtraction_count);
+        }
+    }
+
+    pthread_mutex_unlock(&print_mutex);
+    printf("Exiting safely...\n");
+    exit(0);
+}
+
+// Load checkpoint function - simplified to only read count
+uint64_t load_checkpoint(void)
+{
+    FILE *checkpoint = fopen(CHECKPOINT_FILE, "r");
+    if (!checkpoint)
+    {
+        return 0;
+    }
+
+    uint64_t saved_count = 0;
+    if (fscanf(checkpoint, "%" PRIu64, &saved_count) != 1)
+    {
+        saved_count = 0;
+    }
+    fclose(checkpoint);
+    return saved_count;
+}
 
 void *bloom_load_worker_thread(void *arg)
 {
@@ -898,13 +987,28 @@ void *find_division_path_thread(void *arg)
 void *auto_subtract_points_thread(void *arg)
 {
     struct thread_args *args = (struct thread_args *)arg;
-    struct Point current_point, G_mult, temp_point, result_point;
-    char current_pk[132];
-    uint64_t start = args->start_index;
-    uint64_t end = args->end_index;
+    struct Point *current_points = malloc(args->num_pubkeys * sizeof(struct Point));
+    struct Point G_mult, temp_point, result_point;
+    args->current_pks = malloc(args->num_pubkeys * sizeof(char *));
+    uint64_t local_count = args->thread_id; // Start from thread's ID
+    time_t last_update = time(NULL);
+    time_t last_checkpoint = time(NULL);
 
-    mpz_init_set(current_point.x, args->start_pubkeys->x);
-    mpz_init_set(current_point.y, args->start_pubkeys->y);
+    // Initialize points and keys
+    for (int i = 0; i < args->num_pubkeys; i++)
+    {
+        mpz_init(current_points[i].x);
+        mpz_init(current_points[i].y);
+        mpz_set(current_points[i].x, args->start_pubkeys[i].x);
+        mpz_set(current_points[i].y, args->start_pubkeys[i].y);
+        args->current_pks[i] = malloc(132);
+        if (!args->current_pks[i])
+        {
+            printf("Memory allocation failed for public key %d\n", i);
+            return NULL;
+        }
+    }
+
     mpz_init(G_mult.x);
     mpz_init(G_mult.y);
     mpz_init(temp_point.x);
@@ -912,56 +1016,120 @@ void *auto_subtract_points_thread(void *arg)
     mpz_init(result_point.x);
     mpz_init(result_point.y);
 
-    if (start > 0)
+    // If this is thread 0, handle checkpoint loading
+    if (args->thread_id == 0)
     {
-        mpz_t offset_scalar;
-        mpz_init(offset_scalar);
-        mpz_set_ui(offset_scalar, start);
-        mpz_mul(offset_scalar, offset_scalar, auto_subtraction_value);
-
-        Scalar_Multiplication(G, &G_mult, offset_scalar);
-        Point_Negation(&G_mult, &temp_point);
-        Point_Addition(&current_point, &temp_point, &result_point);
-
-        mpz_set(current_point.x, result_point.x);
-        mpz_set(current_point.y, result_point.y);
-
-        mpz_clear(offset_scalar);
-    }
-
-    for (uint64_t i = start; i < end; i++)
-    {
-        generate_strpublickey(&current_point, true, current_pk);
-
-        if (i % 100 == 0)
-        {
-            printf("\rThread %d: %lu/%lu (%.2f%%) Current PK: %.66s",
-                   args->thread_id, i - start, end - start,
-                   ((double)(i - start) / (end - start)) * 100,
-                   current_pk);
-            fflush(stdout);
-        }
-
-        if (bloom_initialized1 && triple_bloom_check(current_pk))
+        uint64_t checkpoint_count = load_checkpoint();
+        if (checkpoint_count > 0)
         {
             pthread_mutex_lock(&print_mutex);
-            printf("\nMatch found! Thread %d at subtraction %lu\n", args->thread_id, i);
-            printf("Original: %s\n", *args->initial_pks);
-            printf("Found Public Key: %s\n", current_pk);
+            printf("\nResuming from checkpoint: %" PRIu64 "\n", checkpoint_count);
             pthread_mutex_unlock(&print_mutex);
-            break;
+
+            // Calculate total subtractions needed to reach checkpoint
+            mpz_t total_subtract;
+            mpz_init(total_subtract);
+            mpz_mul_ui(total_subtract, auto_subtraction_value, checkpoint_count);
+
+            // Apply checkpoint subtractions
+            Scalar_Multiplication(G, &G_mult, total_subtract);
+            Point_Negation(&G_mult, &temp_point);
+
+            for (int i = 0; i < args->num_pubkeys; i++)
+            {
+                Point_Addition(&current_points[i], &temp_point, &result_point);
+                mpz_set(current_points[i].x, result_point.x);
+                mpz_set(current_points[i].y, result_point.y);
+            }
+
+            mpz_clear(total_subtract);
+
+            // Update global counter and local count
+            pthread_mutex_lock(&subtraction_count_mutex);
+            global_subtraction_count = checkpoint_count;
+            local_count = checkpoint_count + args->thread_id;
+            pthread_mutex_unlock(&subtraction_count_mutex);
         }
-
-        Scalar_Multiplication(G, &G_mult, auto_subtraction_value);
-        Point_Negation(&G_mult, &temp_point);
-        Point_Addition(&current_point, &temp_point, &result_point);
-
-        mpz_set(current_point.x, result_point.x);
-        mpz_set(current_point.y, result_point.y);
     }
 
-    mpz_clear(current_point.x);
-    mpz_clear(current_point.y);
+    // Main processing loop
+    while (1)
+    {
+        // Generate and check current public keys
+        for (int i = 0; i < args->num_pubkeys; i++)
+        {
+            generate_strpublickey(&current_points[i], true, args->current_pks[i]);
+            if (bloom_initialized1 && triple_bloom_check(args->current_pks[i]))
+            {
+                pthread_mutex_lock(&print_mutex);
+                printf("\nMatch found! Thread %d at subtraction %" PRIu64 "\n", args->thread_id, local_count);
+                printf("Original: %s\n", args->initial_pks[i]);
+                printf("Found: %s\n", args->current_pks[i]);
+                pthread_mutex_unlock(&print_mutex);
+                goto cleanup;
+            }
+        }
+
+        // Update counters
+        local_count += args->num_threads;
+        pthread_mutex_lock(&subtraction_count_mutex);
+        global_subtraction_count++;
+        pthread_mutex_unlock(&subtraction_count_mutex);
+
+        // Status update
+        time_t current_time = time(NULL);
+        if (current_time - last_update >= 1)
+        {
+            pthread_mutex_lock(&print_mutex);
+            printf("\rThread %d: %" PRIu64 " subtractions | Global: %" PRIu64 " | Key1: %.20s... Key%d: %.20s...",
+                   args->thread_id, local_count, global_subtraction_count,
+                   args->current_pks[0], args->num_pubkeys, args->current_pks[args->num_pubkeys - 1]);
+            fflush(stdout);
+            pthread_mutex_unlock(&print_mutex);
+            last_update = current_time;
+        }
+
+        // Save periodic checkpoint (thread 0 only)
+        if (args->thread_id == 0 && current_time - last_checkpoint >= 60)
+        {
+            FILE *checkpoint = fopen(CHECKPOINT_FILE, "w");
+            if (checkpoint)
+            {
+                fprintf(checkpoint, "%" PRIu64 "\n", global_subtraction_count);
+                fclose(checkpoint);
+            }
+            last_checkpoint = current_time;
+        }
+
+        // Calculate and perform next subtraction
+        mpz_t step_subtract;
+        mpz_init(step_subtract);
+        mpz_mul_ui(step_subtract, auto_subtraction_value, args->num_threads);
+
+        Scalar_Multiplication(G, &G_mult, step_subtract);
+        Point_Negation(&G_mult, &temp_point);
+        mpz_clear(step_subtract);
+
+        // Apply subtraction to all points
+        for (int i = 0; i < args->num_pubkeys; i++)
+        {
+            Point_Addition(&current_points[i], &temp_point, &result_point);
+            mpz_set(current_points[i].x, result_point.x);
+            mpz_set(current_points[i].y, result_point.y);
+        }
+    }
+
+cleanup:
+    // Cleanup all allocated resources
+    for (int i = 0; i < args->num_pubkeys; i++)
+    {
+        mpz_clear(current_points[i].x);
+        mpz_clear(current_points[i].y);
+        free(args->current_pks[i]);
+    }
+    free(current_points);
+    free(args->current_pks);
+
     mpz_clear(G_mult.x);
     mpz_clear(G_mult.y);
     mpz_clear(temp_point.x);
@@ -1466,16 +1634,13 @@ int main(int argc, char **argv)
     int target_bit = 0;
     int num_threads = 1;
 
-    while ((opt = getopt(argc, argv, "f:b:st:d:a:n:")) != -1)
+    while ((opt = getopt(argc, argv, "f:b:st:d:a:")) != -1)
     {
         switch (opt)
         {
         case 'a':
             auto_subtraction_mode = true;
             mpz_init_set_str(auto_subtraction_value, optarg, 10);
-            break;
-        case 'n':
-            auto_subtraction_count = strtoull(optarg, NULL, 10);
             break;
         case 'd':
             debug_mode = true;
@@ -1497,10 +1662,10 @@ int main(int argc, char **argv)
                 num_threads = MAX_THREADS;
             break;
         default:
-            printf("Usage: %s [-f bloom_file] [-b target_bit] [-t threads] [-s] [-a subtraction_value] [-n count] <pubkey>\n", argv[0]);
+            printf("Usage: %s [-f bloom_file] [-b target_bit] [-t threads] [-s] [-a subtraction_value] <pubkey>\n", argv[0]);
             printf("Operations:\n");
             printf("  Normal mode: <pubkey1> [+|-|x|/] <pubkey2/number>\n");
-            printf("  Auto subtraction mode: -f <bloom_file> -a <value> -n <count> <pubkey>\n");
+            printf("  Auto subtraction mode: -f <bloom_file> -a <value> <pubkey>\n");
             printf("  Division path mode: -b <target_bit> <pubkey1> [pubkey2...]\n");
             exit(1);
         }
@@ -1521,7 +1686,6 @@ int main(int argc, char **argv)
         exit(1);
     }
 
-    // Auto subtraction mode
     if (auto_subtraction_mode)
     {
         if (!bloom_file)
@@ -1529,59 +1693,70 @@ int main(int argc, char **argv)
             printf("Error: Bloom filter (-f) required for auto subtraction mode\n");
             exit(1);
         }
-        if (auto_subtraction_count == 0)
+
+        // Set up signal handler for Ctrl+C
+        signal(SIGINT, handle_interrupt);
+
+        int num_pubkeys = argc;
+        struct Point *start_points = malloc(num_pubkeys * sizeof(struct Point));
+        char **initial_pks = malloc(num_pubkeys * sizeof(char *));
+
+        printf("Starting unlimited auto subtraction with %d threads\n", num_threads);
+        printf("Processing %d public keys\n", num_pubkeys);
+
+        // Initialize start points and keys
+        for (int i = 0; i < num_pubkeys; i++)
         {
-            printf("Error: Number of subtractions (-n) required\n");
-            exit(1);
+            mpz_init(start_points[i].x);
+            mpz_init(start_points[i].y);
+            initial_pks[i] = strdup(argv[i]);
+            set_publickey(argv[i], &start_points[i]);
+            printf("Public key %d: %s\n", i + 1, initial_pks[i]);
         }
 
-        struct Point start_point;
-        mpz_init(start_point.x);
-        mpz_init(start_point.y);
-        set_publickey(argv[0], &start_point);
-
+        // Create and initialize threads
         pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
-        struct thread_args *sub_args = malloc(num_threads * sizeof(struct thread_args));
-
-        // Calculate work distribution
-        uint64_t chunk_size = auto_subtraction_count / num_threads;
-        uint64_t remainder = auto_subtraction_count % num_threads;
-
-        printf("Starting auto subtraction with %d threads\n", num_threads);
-        printf("Total subtractions: %lu\n", auto_subtraction_count);
-        printf("Chunk size per thread: %lu\n", chunk_size);
+        thread_args_array = malloc(num_threads * sizeof(struct thread_args));
 
         for (int i = 0; i < num_threads; i++)
         {
-            sub_args[i].start_pubkeys = &start_point;
-            sub_args[i].initial_pks = &argv[0];
-            sub_args[i].thread_id = i;
+            thread_args_array[i].start_pubkeys = start_points;
+            thread_args_array[i].initial_pks = initial_pks;
+            thread_args_array[i].num_pubkeys = num_pubkeys;
+            thread_args_array[i].thread_id = i;
+            thread_args_array[i].auto_subtraction = true;
+            thread_args_array[i].num_threads = num_threads;
+            thread_args_array[i].start_index = 0;
+            thread_args_array[i].end_index = 0;
+            thread_args_array[i].target_bit = 0;
+            thread_args_array[i].div_ctrl = NULL;
+            thread_args_array[i].metrics = NULL;
+            thread_args_array[i].current_pks = NULL; // Will be initialized in thread
 
-            // Distribute remainder across threads
-            sub_args[i].start_index = i * chunk_size + (i < remainder ? i : remainder);
-            sub_args[i].end_index = (i + 1) * chunk_size + (i < remainder ? i + 1 : remainder);
-
-            if (pthread_create(&threads[i], NULL, auto_subtract_points_thread, &sub_args[i]) != 0)
+            if (pthread_create(&threads[i], NULL, auto_subtract_points_thread, &thread_args_array[i]) != 0)
             {
                 printf("Failed to create thread %d\n", i);
                 exit(1);
             }
-            printf("Thread %d searching range: %lu to %lu\n", i, sub_args[i].start_index, sub_args[i].end_index);
         }
 
-        // Wait for all threads
+        // Wait for threads to complete
         for (int i = 0; i < num_threads; i++)
         {
             pthread_join(threads[i], NULL);
         }
 
-        printf("\nCompleted auto subtraction search\n");
-
         // Cleanup
+        for (int i = 0; i < num_pubkeys; i++)
+        {
+            mpz_clear(start_points[i].x);
+            mpz_clear(start_points[i].y);
+            free(initial_pks[i]);
+        }
+        free(start_points);
+        free(initial_pks);
         free(threads);
-        free(sub_args);
-        mpz_clear(start_point.x);
-        mpz_clear(start_point.y);
+        free(thread_args_array);
         cleanup_bloom_filters();
         mpz_clear(auto_subtraction_value);
         return 0;
