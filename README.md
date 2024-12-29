@@ -54,6 +54,7 @@ git clone https://github.com/Adz2323/ecctools-updated.git
 Compile:
 
 ```
+chmod +x install.sh
 gcc Electrum.c -lcurl -ljson-c -o electrum
 g++ -std=c++17 seg.cpp -o seg -pthread
 g++ gen.cpp -o gen -std=c++17 
