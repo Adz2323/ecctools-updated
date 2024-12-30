@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <sstream>
 #include <iomanip>
+#include <atomic>
 
 class ThreadPool
 {
@@ -26,11 +27,11 @@ private:
     mutable std::mutex queue_mutex;
     std::mutex file_mutex;
     std::condition_variable condition;
-    std::atomic<bool> stop{false};
+    std::atomic<bool> stop;
     std::shared_ptr<std::ofstream> output_file;
-    std::atomic<int> processed_count{0};
-    std::atomic<int> active_tasks{0};
-    std::atomic<bool> force_shutdown{false};
+    std::atomic<int> processed_count;
+    std::atomic<int> active_tasks;
+    std::atomic<bool> force_shutdown;
 
     static const size_t BUFFER_SIZE = 4096;
     std::vector<std::array<char, BUFFER_SIZE>> thread_buffers;
@@ -84,52 +85,71 @@ protected:
         std::string cmd = "./Auto 02145d2611c823a396ef6712ce0f712f09b9b4f3135e3e0aa3230fb9b6d08d1e16 - " + decimal;
         active_tasks++;
 
-        FILE *pipe = nullptr;
-        try
+        // Maximum retries for a single command
+        const int MAX_RETRIES = 3;
+        int retries = 0;
+
+        while (retries < MAX_RETRIES && !stop.load() && !force_shutdown.load())
         {
-            pipe = popen(cmd.c_str(), "r");
-            if (!pipe)
+            FILE *pipe = nullptr;
+            try
             {
-                active_tasks--;
-                return;
-            }
-
-            std::string result;
-            auto &buffer = thread_buffers[thread_id];
-            bool found = false;
-            auto start_time = std::chrono::steady_clock::now();
-
-            while (!found && !stop.load() && !force_shutdown.load())
-            {
-                if (fgets(buffer.data(), buffer.size(), pipe) == nullptr)
-                    break;
-                result += buffer.data();
-                found = processResult(result, decimal);
-
-                auto current_time = std::chrono::steady_clock::now();
-                if (std::chrono::duration_cast<std::chrono::seconds>(
-                        current_time - start_time)
-                        .count() > 10)
+                pipe = popen(cmd.c_str(), "r");
+                if (!pipe)
                 {
-                    std::cerr << "Process timeout for decimal: " << decimal << std::endl;
-                    killProcess(cmd);
-                    break;
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    retries++;
+                    continue;
+                }
+
+                std::string result;
+                auto &buffer = thread_buffers[thread_id];
+                bool found = false;
+                auto start_time = std::chrono::steady_clock::now();
+
+                while (!found && !stop.load() && !force_shutdown.load())
+                {
+                    if (fgets(buffer.data(), buffer.size(), pipe) == nullptr)
+                        break;
+                    result += buffer.data();
+                    found = processResult(result, decimal);
+
+                    auto current_time = std::chrono::steady_clock::now();
+                    if (std::chrono::duration_cast<std::chrono::seconds>(
+                            current_time - start_time)
+                            .count() > 30)
+                    {
+                        std::cerr << "Process timeout for decimal: " << decimal << std::endl;
+                        break;
+                    }
+                }
+
+                if (pipe)
+                {
+                    pclose(pipe);
+                    pipe = nullptr;
+                }
+
+                if (found)
+                    break; // Successfully processed
+
+                retries++;
+                if (retries < MAX_RETRIES)
+                {
+                    std::cerr << "Retrying decimal: " << decimal << " (attempt " << (retries + 1) << ")\n";
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
                 }
             }
-
-            if (pipe)
+            catch (...)
             {
-                pclose(pipe);
-                pipe = nullptr;
+                if (pipe)
+                    pclose(pipe);
+                retries++;
+                if (retries < MAX_RETRIES)
+                {
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                }
             }
-        }
-        catch (...)
-        {
-            if (pipe)
-                pclose(pipe);
-            killProcess(cmd);
-            active_tasks--;
-            throw;
         }
 
         active_tasks--;
@@ -137,7 +157,8 @@ protected:
 
 public:
     ThreadPool(size_t numThreads, std::shared_ptr<std::ofstream> outFile)
-        : output_file(std::move(outFile)), thread_buffers(numThreads)
+        : stop(false), output_file(std::move(outFile)), processed_count(0),
+          active_tasks(0), force_shutdown(false), thread_buffers(numThreads)
     {
         try
         {
@@ -150,9 +171,10 @@ public:
                         Task task;
                         {
                             std::unique_lock<std::mutex> lock(queue_mutex);
-                            condition.wait(lock, [this] { 
+                            auto predicate = [this]() -> bool { 
                                 return force_shutdown.load() || stop.load() || !tasks.empty(); 
-                            });
+                            };
+                            condition.wait(lock, predicate);
                             
                             if ((force_shutdown.load() || stop.load()) && tasks.empty()) {
                                 return;
@@ -343,9 +365,7 @@ int main()
         size_t lines_processed = 0;
 
         auto last_progress = std::chrono::steady_clock::now();
-        auto last_activity = std::chrono::steady_clock::now();
         int last_processed = 0;
-        int stall_count = 0;
         bool eof_reached = false;
 
         while (!pool.isStopped() && !eof_reached)
@@ -400,7 +420,7 @@ int main()
             }
             line_buffer.erase(0, pos);
 
-            // Print progress and check for stalls
+            // Print progress
             auto now = std::chrono::steady_clock::now();
             if (std::chrono::duration_cast<std::chrono::seconds>(now - last_progress).count() >= 5)
             {
@@ -412,33 +432,10 @@ int main()
                           << current_processed << " processed, "
                           << pool.getActiveTaskCount() << " active)\n";
 
-                // Check for stalls
-                if (current_processed == last_processed)
-                {
-                    if (std::chrono::duration_cast<std::chrono::seconds>(now - last_activity).count() > 30)
-                    {
-                        stall_count++;
-                        std::cout << "No progress detected (" << stall_count << " times)\n";
-                        if (stall_count >= 3)
-                        {
-                            std::cout << "Multiple stalls detected, forcing shutdown...\n";
-                            pool.forceShutdown();
-                            break;
-                        }
-                        last_activity = now;
-                    }
-                }
-                else
-                {
-                    stall_count = 0;
-                    last_activity = now;
-                }
-
                 last_processed = current_processed;
                 last_progress = now;
             }
 
-            // Small sleep to prevent CPU overload
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
 
@@ -463,31 +460,47 @@ int main()
             }
         }
 
-        std::cout << "\nFile reading complete. Processed " << lines_processed << " lines.\n";
-        std::cout << "Waiting for remaining tasks to complete...\n";
+        std::cout << "\nFile reading complete. Read " << lines_processed << " lines.\n";
+        std::cout << "Processing remaining tasks...\n";
 
-        // Wait for remaining tasks with a timeout
-        auto shutdown_start = std::chrono::steady_clock::now();
+        // Wait for all tasks to complete, with stall detection and recovery
+        auto last_check = std::chrono::steady_clock::now();
+        int last_task_count = pool.getActiveTaskCount();
+        int last_processed_count = pool.getProcessedCount();
+
         while (pool.getActiveTaskCount() > 0)
         {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                               std::chrono::steady_clock::now() - shutdown_start)
-                               .count();
+            auto now = std::chrono::steady_clock::now();
+            auto check_elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_check).count();
 
-            if (elapsed > 30)
-            {
-                std::cout << "Timeout waiting for tasks to complete. Forcing shutdown...\n";
-                pool.forceShutdown();
-                break;
+            if (check_elapsed >= 10)
+            { // Check progress every 10 seconds
+                int current_tasks = pool.getActiveTaskCount();
+                int current_processed = pool.getProcessedCount();
+
+                // Only reset stalled processes if there's been no progress
+                if (current_processed == last_processed_count)
+                {
+                    std::cout << "Detected stall with " << current_tasks << " tasks remaining. Resetting stalled processes...\n";
+                    system("pkill -f \"./Auto\"");                        // Kill any hung Auto processes
+                    std::this_thread::sleep_for(std::chrono::seconds(2)); // Give processes time to die
+                }
+
+                std::cout << "Tasks remaining: " << current_tasks
+                          << " (Processed " << current_processed << " of " << lines_processed << ")\n";
+
+                last_task_count = current_tasks;
+                last_processed_count = current_processed;
+                last_check = now;
             }
         }
 
         pool.shutdown();
         g_pool = nullptr;
 
-        std::cout << "Processing complete. Total lines processed: " << lines_processed << "\n";
+        std::cout << "Processing complete. Total lines read: " << lines_processed << "\n";
         std::cout << "Total results generated: " << pool.getProcessedCount() << "\n";
     }
     catch (const std::exception &e)
