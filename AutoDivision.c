@@ -48,6 +48,8 @@ pthread_mutex_t subtraction_count_mutex = PTHREAD_MUTEX_INITIALIZER;
 #define CHECKPOINT_FILE "auto_subtraction_checkpoint.txt"
 #define CHECKPOINT_INTERVAL 1000 // Save checkpoint every 1000 subtractions
 struct thread_args *thread_args_array = NULL;
+#define CHUNK_SIZE 100000 // 100K keys per chunk
+#define MAX_CHUNKS 100    // Support up to 10M keys total (100 * 100K)
 
 // Thread management
 #define MAX_THREADS 256
@@ -66,6 +68,22 @@ struct thread_args *thread_args_array = NULL;
 #define WORKER_BATCH_SIZE 10000   // Number of entries per worker batch
 
 #define CHECKPOINT_FILE "auto_subtraction_checkpoint.txt"
+
+struct PublicKeyChunk
+{
+    struct Point *points;
+    char **current_pubkeys;
+    size_t size;
+    struct PublicKeyChunk *next;
+};
+
+struct ChunkedKeyStorage
+{
+    struct PublicKeyChunk *chunks;
+    size_t total_keys;
+    size_t num_chunks;
+    pthread_mutex_t *chunk_mutexes;
+};
 
 // Structure for storing compressed pubkeys
 struct CompressedPubKey
@@ -112,18 +130,21 @@ struct DivisionControl
 
 struct thread_args
 {
-    struct Point *start_pubkeys;
-    int thread_id;
-    char **initial_pks;
-    char **current_pks; // Current public keys
-    uint64_t start_index;
-    uint64_t end_index;
-    bool auto_subtraction;
-    int num_pubkeys;
-    int target_bit;
-    struct DivisionControl *div_ctrl;
-    struct PerformanceMetrics *metrics;
-    int num_threads;
+    struct Point *start_pubkeys;        // Original field
+    int thread_id;                      // Original field
+    char **initial_pks;                 // Original field
+    char **current_pks;                 // Original field
+    uint64_t start_index;               // Original field
+    uint64_t end_index;                 // Original field
+    bool auto_subtraction;              // Original field
+    int num_pubkeys;                    // Original field
+    int target_bit;                     // Original field
+    struct DivisionControl *div_ctrl;   // Original field
+    struct PerformanceMetrics *metrics; // Original field
+    int num_threads;                    // Original field
+    // New fields for chunk support
+    struct PublicKeyChunk *chunk; // Current chunk being processed
+    pthread_mutex_t *chunk_mutex; // Mutex for chunk access
 };
 
 struct bloom_load_worker
@@ -198,6 +219,389 @@ int read_pubkey_at_position(size_t pos, char *pubkey_hex);
 int64_t binary_search_pubkey(const char *target_pubkey);
 int init_search_file(const char *filename);
 void handle_interrupt(int sig);
+struct ChunkedKeyStorage *init_chunked_storage(void);
+int load_keys_from_file(struct ChunkedKeyStorage *storage, const char *filename);
+struct PublicKeyChunk *add_chunk(struct ChunkedKeyStorage *storage);
+int verify_chunks(struct ChunkedKeyStorage *storage);
+static bool setup_thread(struct thread_args *args, int thread_id, size_t start_idx,
+                         size_t end_idx, struct ChunkedKeyStorage *storage, int num_threads);
+static bool init_thread_resources(pthread_t **threads, int num_threads, size_t num_pubkeys,
+                                  struct ChunkedKeyStorage *storage);
+static void cleanup_thread_resources(pthread_t *threads, struct thread_args *args,
+                                     int num_threads, struct ChunkedKeyStorage *storage);
+static void cleanup_storage(struct ChunkedKeyStorage *storage);
+static struct PublicKeyChunk *find_chunk_for_range(struct ChunkedKeyStorage *storage,
+                                                   size_t start_idx, size_t end_idx);
+static int get_chunk_index(struct ChunkedKeyStorage *storage, struct PublicKeyChunk *chunk);
+
+static int get_chunk_index(struct ChunkedKeyStorage *storage, struct PublicKeyChunk *chunk)
+{
+    struct PublicKeyChunk *current = storage->chunks;
+    int index = 0;
+
+    while (current && current != chunk)
+    {
+        index++;
+        current = current->next;
+    }
+
+    return index < MAX_CHUNKS ? index : 0;
+}
+
+static struct PublicKeyChunk *find_chunk_for_range(struct ChunkedKeyStorage *storage,
+                                                   size_t start_idx, size_t end_idx)
+{
+    struct PublicKeyChunk *current = storage->chunks;
+    size_t current_pos = 0;
+
+    while (current)
+    {
+        if (current_pos + current->size > start_idx)
+        {
+            return current;
+        }
+        current_pos += current->size;
+        current = current->next;
+    }
+    return NULL;
+}
+
+static bool init_thread_resources(pthread_t **threads, int num_threads, size_t num_pubkeys,
+                                  struct ChunkedKeyStorage *storage)
+{
+    *threads = malloc(num_threads * sizeof(pthread_t));
+    thread_args_array = malloc(num_threads * sizeof(struct thread_args));
+
+    if (!*threads || !thread_args_array)
+    {
+        printf("Failed to allocate thread resources\n");
+        free(*threads);
+        free(thread_args_array);
+        return false;
+    }
+
+    // Initialize common thread arguments
+    for (int i = 0; i < num_threads; i++)
+    {
+        thread_args_array[i].num_threads = num_threads;
+        thread_args_array[i].auto_subtraction = true;
+        thread_args_array[i].div_ctrl = NULL;
+        thread_args_array[i].metrics = NULL;
+        thread_args_array[i].current_pks = NULL;
+    }
+
+    return true;
+}
+
+static bool setup_thread(struct thread_args *args, int thread_id, size_t start_idx,
+                         size_t end_idx, struct ChunkedKeyStorage *storage, int num_threads)
+{
+    args->thread_id = thread_id;
+    args->start_index = start_idx;
+    args->end_index = end_idx;
+    args->num_pubkeys = end_idx - start_idx;
+
+    if (storage)
+    {
+        // Find appropriate chunk and set up chunk-specific data
+        struct PublicKeyChunk *chunk = find_chunk_for_range(storage, start_idx, end_idx);
+        if (!chunk)
+        {
+            printf("Failed to find appropriate chunk for thread %d\n", thread_id);
+            return false;
+        }
+        args->chunk = chunk;
+        args->chunk_mutex = &storage->chunk_mutexes[get_chunk_index(storage, chunk)];
+    }
+    else
+    {
+        args->chunk = NULL;
+        args->chunk_mutex = NULL;
+    }
+
+    return true;
+}
+
+static void cleanup_thread_resources(pthread_t *threads, struct thread_args *args,
+                                     int num_threads, struct ChunkedKeyStorage *storage)
+{
+    if (threads)
+        free(threads);
+
+    if (args)
+    {
+        for (int i = 0; i < num_threads; i++)
+        {
+            if (args[i].current_pks)
+            {
+                for (size_t j = 0; j < args[i].num_pubkeys; j++)
+                {
+                    free(args[i].current_pks[j]);
+                }
+                free(args[i].current_pks);
+            }
+        }
+        free(args);
+    }
+
+    if (storage)
+        cleanup_storage(storage);
+}
+
+static void cleanup_storage(struct ChunkedKeyStorage *storage)
+{
+    if (!storage)
+        return;
+
+    struct PublicKeyChunk *current = storage->chunks;
+    while (current)
+    {
+        struct PublicKeyChunk *next = current->next;
+        for (size_t i = 0; i < current->size; i++)
+        {
+            mpz_clear(current->points[i].x);
+            mpz_clear(current->points[i].y);
+            free(current->current_pubkeys[i]);
+        }
+        free(current->points);
+        free(current->current_pubkeys);
+        free(current);
+        current = next;
+    }
+
+    for (int i = 0; i < MAX_CHUNKS; i++)
+    {
+        pthread_mutex_destroy(&storage->chunk_mutexes[i]);
+    }
+    free(storage->chunk_mutexes);
+    free(storage);
+}
+
+struct PublicKeyChunk *add_chunk(struct ChunkedKeyStorage *storage)
+{
+    if (storage->num_chunks >= MAX_CHUNKS)
+    {
+        printf("\nWarning: Reached maximum chunks (%d), total keys: %zu\n",
+               MAX_CHUNKS, storage->total_keys);
+        return NULL;
+    }
+
+    struct PublicKeyChunk *chunk = malloc(sizeof(struct PublicKeyChunk));
+    if (!chunk)
+    {
+        printf("Error: Failed to allocate chunk structure\n");
+        return NULL;
+    }
+
+    // Allocate arrays for points and pubkeys
+    chunk->points = malloc(CHUNK_SIZE * sizeof(struct Point));
+    chunk->current_pubkeys = malloc(CHUNK_SIZE * sizeof(char *));
+
+    if (!chunk->points || !chunk->current_pubkeys)
+    {
+        printf("Error: Failed to allocate chunk arrays\n");
+        free(chunk->points);
+        free(chunk->current_pubkeys);
+        free(chunk);
+        return NULL;
+    }
+
+    // Initialize all GMP variables and strings
+    for (size_t i = 0; i < CHUNK_SIZE; i++)
+    {
+        mpz_init(chunk->points[i].x);
+        mpz_init(chunk->points[i].y);
+        chunk->current_pubkeys[i] = malloc(67); // 66 chars + null terminator
+        if (!chunk->current_pubkeys[i])
+        {
+            // Cleanup on failure
+            for (size_t j = 0; j < i; j++)
+            {
+                mpz_clear(chunk->points[j].x);
+                mpz_clear(chunk->points[j].y);
+                free(chunk->current_pubkeys[j]);
+            }
+            free(chunk->points);
+            free(chunk->current_pubkeys);
+            free(chunk);
+            return NULL;
+        }
+        chunk->current_pubkeys[i][0] = '\0'; // Initialize to empty string
+    }
+
+    chunk->size = 0;
+    chunk->next = storage->chunks;
+    storage->chunks = chunk;
+    storage->num_chunks++;
+
+    printf("\nCreated chunk %zu (capacity: %d keys)\n",
+           storage->num_chunks, CHUNK_SIZE);
+
+    return chunk;
+}
+
+struct ChunkedKeyStorage *init_chunked_storage(void)
+{
+    struct ChunkedKeyStorage *storage = malloc(sizeof(struct ChunkedKeyStorage));
+    if (!storage)
+    {
+        printf("Failed to allocate storage structure\n");
+        return NULL;
+    }
+
+    storage->chunks = NULL;
+    storage->total_keys = 0;
+    storage->num_chunks = 0;
+    storage->chunk_mutexes = malloc(MAX_CHUNKS * sizeof(pthread_mutex_t));
+
+    if (!storage->chunk_mutexes)
+    {
+        printf("Failed to allocate chunk mutexes\n");
+        free(storage);
+        return NULL;
+    }
+
+    for (int i = 0; i < MAX_CHUNKS; i++)
+    {
+        pthread_mutex_init(&storage->chunk_mutexes[i], NULL);
+    }
+
+    return storage;
+}
+
+int load_keys_from_file(struct ChunkedKeyStorage *storage, const char *filename)
+{
+    FILE *file = fopen(filename, "r");
+    if (!file)
+    {
+        printf("Error: Cannot open file %s\n", filename);
+        return 0;
+    }
+
+    char buffer[8192] = {0}; // Increased buffer size for longer lines
+    struct PublicKeyChunk *current = NULL;
+    size_t total_keys = 0;
+    char pubkey[67]; // 66 chars + null terminator
+    size_t pubkey_len = 0;
+    int pos = 0;
+
+    // Initialize first chunk
+    current = add_chunk(storage);
+    if (!current)
+    {
+        fclose(file);
+        return 0;
+    }
+
+    while (fgets(buffer, sizeof(buffer), file))
+    {
+        pos = 0;
+
+        // Process each character in the buffer
+        for (int i = 0; buffer[i] != '\0'; i++)
+        {
+            if (buffer[i] != ' ' && buffer[i] != '\n')
+            {
+                if (pos < 66)
+                { // Only collect up to 66 characters
+                    pubkey[pos++] = buffer[i];
+                }
+            }
+            else if (pos == 66)
+            {                      // We have a complete pubkey
+                pubkey[66] = '\0'; // Null terminate
+
+                // Create new chunk if current one is full
+                if (current->size >= CHUNK_SIZE)
+                {
+                    current = add_chunk(storage);
+                    if (!current)
+                    {
+                        printf("\nReached maximum capacity at %zu keys\n", storage->total_keys);
+                        fclose(file);
+                        return storage->total_keys > 0;
+                    }
+                }
+
+                // Validate pubkey format (should start with 02 or 03)
+                if ((pubkey[0] == '0' && (pubkey[1] == '2' || pubkey[1] == '3')))
+                {
+                    // Set the public key
+                    set_publickey(pubkey, &current->points[current->size]);
+                    strncpy(current->current_pubkeys[current->size], pubkey, 66);
+                    current->current_pubkeys[current->size][66] = '\0';
+
+                    current->size++;
+                    storage->total_keys++;
+                    total_keys++;
+
+                    if (total_keys % 10000 == 0)
+                    {
+                        printf("\rLoaded %zu keys into %zu chunks...",
+                               total_keys, storage->num_chunks);
+                        fflush(stdout);
+                    }
+                }
+                pos = 0; // Reset for next pubkey
+            }
+        }
+    }
+
+    // Handle last key if buffer ended exactly at 66 chars
+    if (pos == 66)
+    {
+        pubkey[66] = '\0';
+        if ((pubkey[0] == '0' && (pubkey[1] == '2' || pubkey[1] == '3')))
+        {
+            if (current->size < CHUNK_SIZE)
+            {
+                set_publickey(pubkey, &current->points[current->size]);
+                strncpy(current->current_pubkeys[current->size], pubkey, 66);
+                current->current_pubkeys[current->size][66] = '\0';
+                current->size++;
+                storage->total_keys++;
+                total_keys++;
+            }
+        }
+    }
+
+    printf("\nSuccessfully loaded %zu keys into %zu chunks\n",
+           storage->total_keys, storage->num_chunks);
+
+    fclose(file);
+    return 1;
+}
+
+int verify_chunks(struct ChunkedKeyStorage *storage)
+{
+    struct PublicKeyChunk *current = storage->chunks;
+    size_t total_keys = 0;
+    size_t chunk_num = 0;
+
+    while (current)
+    {
+        chunk_num++;
+        if (current->size > CHUNK_SIZE)
+        {
+            printf("Error: Chunk %zu has invalid size %zu (max: %d)\n",
+                   chunk_num, current->size, CHUNK_SIZE);
+            return 0;
+        }
+        total_keys += current->size;
+        current = current->next;
+    }
+
+    if (total_keys != storage->total_keys)
+    {
+        printf("Error: Total keys mismatch. Found %zu, expected %zu\n",
+               total_keys, storage->total_keys);
+        return 0;
+    }
+
+    printf("Chunk verification passed: %zu chunks, %zu total keys\n",
+           chunk_num, total_keys);
+    return 1;
+}
 
 void handle_interrupt(int sig)
 {
@@ -984,31 +1388,103 @@ void *find_division_path_thread(void *arg)
     return NULL;
 }
 
+// Modified thread setup for auto-subtraction mode
 void *auto_subtract_points_thread(void *arg)
 {
     struct thread_args *args = (struct thread_args *)arg;
-    struct Point *current_points = malloc(args->num_pubkeys * sizeof(struct Point));
+    struct Point *current_points = NULL;
     struct Point G_mult, temp_point, result_point;
-    args->current_pks = malloc(args->num_pubkeys * sizeof(char *));
-    uint64_t local_count = args->thread_id; // Start from thread's ID
+    uint64_t local_count = args->thread_id;
     time_t last_update = time(NULL);
     time_t last_checkpoint = time(NULL);
 
-    // Initialize points and keys
-    for (int i = 0; i < args->num_pubkeys; i++)
+    // Get the chunk size safely
+    size_t num_points_to_process = 0;
+    if (args->chunk)
+    {
+        pthread_mutex_lock(args->chunk_mutex);
+        num_points_to_process = args->chunk->size;
+        pthread_mutex_unlock(args->chunk_mutex);
+    }
+    else
+    {
+        num_points_to_process = args->num_pubkeys;
+    }
+
+    // Allocate points array
+    current_points = malloc(num_points_to_process * sizeof(struct Point));
+    if (!current_points)
+    {
+        printf("Thread %d: Failed to allocate memory for points\n", args->thread_id);
+        return NULL;
+    }
+
+    // Initialize points
+    for (size_t i = 0; i < num_points_to_process; i++)
     {
         mpz_init(current_points[i].x);
         mpz_init(current_points[i].y);
-        mpz_set(current_points[i].x, args->start_pubkeys[i].x);
-        mpz_set(current_points[i].y, args->start_pubkeys[i].y);
-        args->current_pks[i] = malloc(132);
+    }
+
+    // Initialize result arrays
+    args->current_pks = malloc(num_points_to_process * sizeof(char *));
+    if (!args->current_pks)
+    {
+        for (size_t i = 0; i < num_points_to_process; i++)
+        {
+            mpz_clear(current_points[i].x);
+            mpz_clear(current_points[i].y);
+        }
+        free(current_points);
+        return NULL;
+    }
+
+    for (size_t i = 0; i < num_points_to_process; i++)
+    {
+        args->current_pks[i] = malloc(67); // 66 chars + null terminator
         if (!args->current_pks[i])
         {
-            printf("Memory allocation failed for public key %d\n", i);
+            // Cleanup previous allocations
+            for (size_t j = 0; j < i; j++)
+            {
+                free(args->current_pks[j]);
+            }
+            free(args->current_pks);
+            for (size_t j = 0; j < num_points_to_process; j++)
+            {
+                mpz_clear(current_points[j].x);
+                mpz_clear(current_points[j].y);
+            }
+            free(current_points);
             return NULL;
         }
     }
 
+    // Copy initial points with mutex protection
+    if (args->chunk)
+    {
+        pthread_mutex_lock(args->chunk_mutex);
+        for (size_t i = 0; i < num_points_to_process; i++)
+        {
+            mpz_set(current_points[i].x, args->chunk->points[i].x);
+            mpz_set(current_points[i].y, args->chunk->points[i].y);
+            strncpy(args->current_pks[i], args->chunk->current_pubkeys[i], 66);
+            args->current_pks[i][66] = '\0';
+        }
+        pthread_mutex_unlock(args->chunk_mutex);
+    }
+    else
+    {
+        for (size_t i = 0; i < num_points_to_process; i++)
+        {
+            mpz_set(current_points[i].x, args->start_pubkeys[i].x);
+            mpz_set(current_points[i].y, args->start_pubkeys[i].y);
+            strncpy(args->current_pks[i], args->initial_pks[i], 66);
+            args->current_pks[i][66] = '\0';
+        }
+    }
+
+    // Initialize GMP variables
     mpz_init(G_mult.x);
     mpz_init(G_mult.y);
     mpz_init(temp_point.x);
@@ -1016,61 +1492,34 @@ void *auto_subtract_points_thread(void *arg)
     mpz_init(result_point.x);
     mpz_init(result_point.y);
 
-    // If this is thread 0, handle checkpoint loading
-    if (args->thread_id == 0)
-    {
-        uint64_t checkpoint_count = load_checkpoint();
-        if (checkpoint_count > 0)
-        {
-            pthread_mutex_lock(&print_mutex);
-            printf("\nResuming from checkpoint: %" PRIu64 "\n", checkpoint_count);
-            pthread_mutex_unlock(&print_mutex);
-
-            // Calculate total subtractions needed to reach checkpoint
-            mpz_t total_subtract;
-            mpz_init(total_subtract);
-            mpz_mul_ui(total_subtract, auto_subtraction_value, checkpoint_count);
-
-            // Apply checkpoint subtractions
-            Scalar_Multiplication(G, &G_mult, total_subtract);
-            Point_Negation(&G_mult, &temp_point);
-
-            for (int i = 0; i < args->num_pubkeys; i++)
-            {
-                Point_Addition(&current_points[i], &temp_point, &result_point);
-                mpz_set(current_points[i].x, result_point.x);
-                mpz_set(current_points[i].y, result_point.y);
-            }
-
-            mpz_clear(total_subtract);
-
-            // Update global counter and local count
-            pthread_mutex_lock(&subtraction_count_mutex);
-            global_subtraction_count = checkpoint_count;
-            local_count = checkpoint_count + args->thread_id;
-            pthread_mutex_unlock(&subtraction_count_mutex);
-        }
-    }
-
     // Main processing loop
     while (1)
     {
         // Generate and check current public keys
-        for (int i = 0; i < args->num_pubkeys; i++)
+        for (size_t i = 0; i < num_points_to_process; i++)
         {
             generate_strpublickey(&current_points[i], true, args->current_pks[i]);
+
             if (bloom_initialized1 && triple_bloom_check(args->current_pks[i]))
             {
                 pthread_mutex_lock(&print_mutex);
-                printf("\nMatch found! Thread %d at subtraction %" PRIu64 "\n", args->thread_id, local_count);
-                printf("Original: %s\n", args->initial_pks[i]);
+                printf("\nMatch found! Thread %d at subtraction %" PRIu64 "\n",
+                       args->thread_id, local_count);
+                if (args->chunk)
+                {
+                    printf("Original chunk key %zu: %s\n", i, args->chunk->current_pubkeys[i]);
+                }
+                else
+                {
+                    printf("Original: %s\n", args->initial_pks[i]);
+                }
                 printf("Found: %s\n", args->current_pks[i]);
                 pthread_mutex_unlock(&print_mutex);
                 goto cleanup;
             }
         }
 
-        // Update counters
+        // Rest of the processing loop remains the same...
         local_count += args->num_threads;
         pthread_mutex_lock(&subtraction_count_mutex);
         global_subtraction_count++;
@@ -1081,24 +1530,12 @@ void *auto_subtract_points_thread(void *arg)
         if (current_time - last_update >= 1)
         {
             pthread_mutex_lock(&print_mutex);
-            printf("\rThread %d: %" PRIu64 " subtractions | Global: %" PRIu64 " | Key1: %.20s... Key%d: %.20s...",
+            printf("\rThread %d: %" PRIu64 " subtractions | Global: %" PRIu64 " | Key1: %.20s...",
                    args->thread_id, local_count, global_subtraction_count,
-                   args->current_pks[0], args->num_pubkeys, args->current_pks[args->num_pubkeys - 1]);
+                   args->current_pks[0]);
             fflush(stdout);
             pthread_mutex_unlock(&print_mutex);
             last_update = current_time;
-        }
-
-        // Save periodic checkpoint (thread 0 only)
-        if (args->thread_id == 0 && current_time - last_checkpoint >= 60)
-        {
-            FILE *checkpoint = fopen(CHECKPOINT_FILE, "w");
-            if (checkpoint)
-            {
-                fprintf(checkpoint, "%" PRIu64 "\n", global_subtraction_count);
-                fclose(checkpoint);
-            }
-            last_checkpoint = current_time;
         }
 
         // Calculate and perform next subtraction
@@ -1110,8 +1547,8 @@ void *auto_subtract_points_thread(void *arg)
         Point_Negation(&G_mult, &temp_point);
         mpz_clear(step_subtract);
 
-        // Apply subtraction to all points
-        for (int i = 0; i < args->num_pubkeys; i++)
+        // Apply subtraction to all points with boundary check
+        for (size_t i = 0; i < num_points_to_process; i++)
         {
             Point_Addition(&current_points[i], &temp_point, &result_point);
             mpz_set(current_points[i].x, result_point.x);
@@ -1120,22 +1557,28 @@ void *auto_subtract_points_thread(void *arg)
     }
 
 cleanup:
-    // Cleanup all allocated resources
-    for (int i = 0; i < args->num_pubkeys; i++)
-    {
-        mpz_clear(current_points[i].x);
-        mpz_clear(current_points[i].y);
-        free(args->current_pks[i]);
-    }
-    free(current_points);
-    free(args->current_pks);
-
+    // Cleanup GMP variables
     mpz_clear(G_mult.x);
     mpz_clear(G_mult.y);
     mpz_clear(temp_point.x);
     mpz_clear(temp_point.y);
     mpz_clear(result_point.x);
     mpz_clear(result_point.y);
+
+    // Cleanup points
+    for (size_t i = 0; i < num_points_to_process; i++)
+    {
+        mpz_clear(current_points[i].x);
+        mpz_clear(current_points[i].y);
+    }
+    free(current_points);
+
+    // Cleanup public keys
+    for (size_t i = 0; i < num_points_to_process; i++)
+    {
+        free(args->current_pks[i]);
+    }
+    free(args->current_pks);
 
     return NULL;
 }
@@ -1625,16 +2068,18 @@ int main(int argc, char **argv)
     mpz_init(inversemultiplier);
     bool FLAG_NUMBER = false;
     char str_publickey[132];
+    struct ChunkedKeyStorage *storage = NULL;
 
     struct PerformanceMetrics metrics;
     initialize_performance_metrics(&metrics);
 
     int opt;
     char *bloom_file = NULL;
+    char *input_file = NULL;
     int target_bit = 0;
     int num_threads = 1;
 
-    while ((opt = getopt(argc, argv, "f:b:st:d:a:")) != -1)
+    while ((opt = getopt(argc, argv, "f:b:st:d:a:i:")) != -1)
     {
         switch (opt)
         {
@@ -1647,6 +2092,9 @@ int main(int argc, char **argv)
             break;
         case 'f':
             bloom_file = optarg;
+            break;
+        case 'i':
+            input_file = optarg;
             break;
         case 'b':
             target_bit = atoi(optarg);
@@ -1662,10 +2110,11 @@ int main(int argc, char **argv)
                 num_threads = MAX_THREADS;
             break;
         default:
-            printf("Usage: %s [-f bloom_file] [-b target_bit] [-t threads] [-s] [-a subtraction_value] <pubkey>\n", argv[0]);
+            printf("Usage: %s [-f bloom_file] [-b target_bit] [-t threads] [-s] [-a subtraction_value] [-i input_file] <pubkey>\n", argv[0]);
             printf("Operations:\n");
             printf("  Normal mode: <pubkey1> [+|-|x|/] <pubkey2/number>\n");
-            printf("  Auto subtraction mode: -f <bloom_file> -a <value> <pubkey>\n");
+            printf("  Auto subtraction mode (command line): -f <bloom_file> -a <value> <pubkey>\n");
+            printf("  Auto subtraction mode (file input): -f <bloom_file> -a <value> -i <input_file>\n");
             printf("  Division path mode: -b <target_bit> <pubkey1> [pubkey2...]\n");
             exit(1);
         }
@@ -1680,12 +2129,11 @@ int main(int argc, char **argv)
         exit(1);
     }
 
-    if (argc < 1)
+    if (!input_file && argc < 1)
     {
-        printf("Error: No public key provided\n");
+        printf("Error: No public key provided and no input file specified\n");
         exit(1);
     }
-
     if (auto_subtraction_mode)
     {
         if (!bloom_file)
@@ -1697,9 +2145,64 @@ int main(int argc, char **argv)
         // Set up signal handler for Ctrl+C
         signal(SIGINT, handle_interrupt);
 
-        int num_pubkeys = argc;
-        struct Point *start_points = malloc(num_pubkeys * sizeof(struct Point));
-        char **initial_pks = malloc(num_pubkeys * sizeof(char *));
+        int num_pubkeys;
+        struct Point *start_points = NULL;
+        char **initial_pks = NULL;
+
+        if (input_file)
+        {
+            storage = init_chunked_storage();
+            if (!storage)
+            {
+                printf("Failed to initialize storage\n");
+                exit(1);
+            }
+
+            if (!load_keys_from_file(storage, input_file))
+            {
+                printf("Failed to load keys from input file\n");
+                if (storage)
+                {
+                    cleanup_storage(storage);
+                }
+                exit(1);
+            }
+
+            num_pubkeys = storage->total_keys;
+            if (num_pubkeys == 0)
+            {
+                printf("Error: No valid public keys loaded from file\n");
+                cleanup_storage(storage);
+                exit(1);
+            }
+
+            printf("Loaded %d keys from file\n", num_pubkeys);
+
+            // Verify chunks after loading
+            if (!verify_chunks(storage))
+            {
+                printf("Error: Chunk verification failed\n");
+                cleanup_storage(storage);
+                exit(1);
+            }
+        }
+        else
+        {
+            num_pubkeys = argc;
+        }
+
+        // Allocate memory for points and keys
+        start_points = malloc(num_pubkeys * sizeof(struct Point));
+        initial_pks = malloc(num_pubkeys * sizeof(char *));
+
+        if (!start_points || !initial_pks)
+        {
+            printf("Failed to allocate memory for points or keys\n");
+            free(start_points);
+            free(initial_pks);
+            cleanup_storage(storage);
+            exit(1);
+        }
 
         printf("Starting unlimited auto subtraction with %d threads\n", num_threads);
         printf("Processing %d public keys\n", num_pubkeys);
@@ -1709,33 +2212,210 @@ int main(int argc, char **argv)
         {
             mpz_init(start_points[i].x);
             mpz_init(start_points[i].y);
-            initial_pks[i] = strdup(argv[i]);
-            set_publickey(argv[i], &start_points[i]);
+
+            if (storage)
+            {
+                struct PublicKeyChunk *current = storage->chunks;
+                int accumulated_size = 0;
+
+                // Find the correct chunk for this key
+                while (current && i >= accumulated_size + current->size)
+                {
+                    accumulated_size += current->size;
+                    current = current->next;
+                }
+
+                if (!current)
+                {
+                    printf("Error: Invalid chunk access at key %d\n", i);
+                    // Cleanup already initialized points
+                    for (int j = 0; j < i; j++)
+                    {
+                        mpz_clear(start_points[j].x);
+                        mpz_clear(start_points[j].y);
+                        free(initial_pks[j]);
+                    }
+                    free(start_points);
+                    free(initial_pks);
+                    cleanup_storage(storage);
+                    exit(1);
+                }
+
+                int chunk_index = i - accumulated_size;
+                if (chunk_index < 0 || chunk_index >= current->size)
+                {
+                    printf("Error: Invalid chunk index %d at key %d\n", chunk_index, i);
+                    // Cleanup
+                    for (int j = 0; j < i; j++)
+                    {
+                        mpz_clear(start_points[j].x);
+                        mpz_clear(start_points[j].y);
+                        free(initial_pks[j]);
+                    }
+                    free(start_points);
+                    free(initial_pks);
+                    cleanup_storage(storage);
+                    exit(1);
+                }
+
+                // Copy from storage with mutex protection
+                pthread_mutex_lock(&storage->chunk_mutexes[get_chunk_index(storage, current)]);
+                mpz_set(start_points[i].x, current->points[chunk_index].x);
+                mpz_set(start_points[i].y, current->points[chunk_index].y);
+                initial_pks[i] = strdup(current->current_pubkeys[chunk_index]);
+                pthread_mutex_unlock(&storage->chunk_mutexes[get_chunk_index(storage, current)]);
+
+                if (!initial_pks[i])
+                {
+                    printf("Failed to allocate memory for key %d\n", i);
+                    // Cleanup
+                    for (int j = 0; j < i; j++)
+                    {
+                        mpz_clear(start_points[j].x);
+                        mpz_clear(start_points[j].y);
+                        free(initial_pks[j]);
+                    }
+                    free(start_points);
+                    free(initial_pks);
+                    cleanup_storage(storage);
+                    exit(1);
+                }
+            }
+            else
+            {
+                // Use command line input
+                if (i >= argc)
+                {
+                    printf("Error: Not enough command line arguments\n");
+                    // Cleanup
+                    for (int j = 0; j < i; j++)
+                    {
+                        mpz_clear(start_points[j].x);
+                        mpz_clear(start_points[j].y);
+                        free(initial_pks[j]);
+                    }
+                    free(start_points);
+                    free(initial_pks);
+                    exit(1);
+                }
+
+                initial_pks[i] = strdup(argv[i]);
+                if (!initial_pks[i])
+                {
+                    printf("Failed to allocate memory for key %d\n", i);
+                    // Cleanup
+                    for (int j = 0; j < i; j++)
+                    {
+                        mpz_clear(start_points[j].x);
+                        mpz_clear(start_points[j].y);
+                        free(initial_pks[j]);
+                    }
+                    free(start_points);
+                    free(initial_pks);
+                    exit(1);
+                }
+                set_publickey(argv[i], &start_points[i]);
+            }
             printf("Public key %d: %s\n", i + 1, initial_pks[i]);
         }
+        // Calculate optimal thread distribution
+        int keys_per_thread = (num_pubkeys + num_threads - 1) / num_threads;
 
         // Create and initialize threads
         pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
         thread_args_array = malloc(num_threads * sizeof(struct thread_args));
 
+        if (!threads || !thread_args_array)
+        {
+            printf("Failed to allocate memory for threads\n");
+            // Cleanup points and keys
+            for (int i = 0; i < num_pubkeys; i++)
+            {
+                mpz_clear(start_points[i].x);
+                mpz_clear(start_points[i].y);
+                free(initial_pks[i]);
+            }
+            free(start_points);
+            free(initial_pks);
+            free(threads);
+            free(thread_args_array);
+            cleanup_storage(storage);
+            exit(1);
+        }
+
+        // Initialize threads
         for (int i = 0; i < num_threads; i++)
         {
+            int start_idx = i * keys_per_thread;
+            int end_idx = (i == num_threads - 1) ? num_pubkeys : (start_idx + keys_per_thread);
+
             thread_args_array[i].start_pubkeys = start_points;
             thread_args_array[i].initial_pks = initial_pks;
-            thread_args_array[i].num_pubkeys = num_pubkeys;
+            thread_args_array[i].num_pubkeys = end_idx - start_idx;
             thread_args_array[i].thread_id = i;
             thread_args_array[i].auto_subtraction = true;
             thread_args_array[i].num_threads = num_threads;
-            thread_args_array[i].start_index = 0;
-            thread_args_array[i].end_index = 0;
+            thread_args_array[i].start_index = start_idx;
+            thread_args_array[i].end_index = end_idx;
             thread_args_array[i].target_bit = 0;
             thread_args_array[i].div_ctrl = NULL;
             thread_args_array[i].metrics = NULL;
-            thread_args_array[i].current_pks = NULL; // Will be initialized in thread
+            thread_args_array[i].current_pks = NULL;
+
+            if (storage)
+            {
+                // Find the correct chunk for this thread's start index
+                struct PublicKeyChunk *current = storage->chunks;
+                int accumulated_size = 0;
+
+                while (current && start_idx >= accumulated_size + current->size)
+                {
+                    accumulated_size += current->size;
+                    current = current->next;
+                }
+
+                if (!current)
+                {
+                    printf("Error: Could not find appropriate chunk for thread %d\n", i);
+                    // Cleanup and exit
+                    for (int j = 0; j < num_pubkeys; j++)
+                    {
+                        mpz_clear(start_points[j].x);
+                        mpz_clear(start_points[j].y);
+                        free(initial_pks[j]);
+                    }
+                    free(start_points);
+                    free(initial_pks);
+                    free(threads);
+                    free(thread_args_array);
+                    cleanup_storage(storage);
+                    exit(1);
+                }
+
+                thread_args_array[i].chunk = current;
+                thread_args_array[i].chunk_mutex = &storage->chunk_mutexes[get_chunk_index(storage, current)];
+            }
+            else
+            {
+                thread_args_array[i].chunk = NULL;
+                thread_args_array[i].chunk_mutex = NULL;
+            }
 
             if (pthread_create(&threads[i], NULL, auto_subtract_points_thread, &thread_args_array[i]) != 0)
             {
                 printf("Failed to create thread %d\n", i);
+                // Cleanup everything
+                for (int j = 0; j < num_pubkeys; j++)
+                {
+                    mpz_clear(start_points[j].x);
+                    mpz_clear(start_points[j].y);
+                    free(initial_pks[j]);
+                }
+                free(start_points);
+                free(initial_pks);
+                free(threads);
+                free(thread_args_array);
+                cleanup_storage(storage);
                 exit(1);
             }
         }
@@ -1746,7 +2426,7 @@ int main(int argc, char **argv)
             pthread_join(threads[i], NULL);
         }
 
-        // Cleanup
+        // Cleanup auto-subtraction mode resources
         for (int i = 0; i < num_pubkeys; i++)
         {
             mpz_clear(start_points[i].x);
@@ -1757,12 +2437,9 @@ int main(int argc, char **argv)
         free(initial_pks);
         free(threads);
         free(thread_args_array);
-        cleanup_bloom_filters();
-        mpz_clear(auto_subtraction_value);
-        return 0;
     }
     // Normal operation mode (non-threaded)
-    if (target_bit == 0)
+    if (target_bit == 0 && !auto_subtraction_mode)
     {
         if (argc != 3)
         {
@@ -1858,17 +2535,39 @@ int main(int argc, char **argv)
         generate_strpublickey(&C, true, str_publickey);
         printf("Result: %s\n\n", str_publickey);
     }
-    else
+    else if (target_bit != 0) // Division path mode
     {
         int num_pubkeys = argc;
         struct Point *pubkeys = malloc(num_pubkeys * sizeof(struct Point));
         char **initial_pks = malloc(num_pubkeys * sizeof(char *));
+
+        if (!pubkeys || !initial_pks)
+        {
+            printf("Failed to allocate memory for division path mode\n");
+            free(pubkeys);
+            free(initial_pks);
+            exit(1);
+        }
 
         for (int i = 0; i < num_pubkeys; i++)
         {
             mpz_init(pubkeys[i].x);
             mpz_init(pubkeys[i].y);
             initial_pks[i] = malloc(132);
+            if (!initial_pks[i])
+            {
+                printf("Failed to allocate memory for public key %d\n", i);
+                // Cleanup
+                for (int j = 0; j < i; j++)
+                {
+                    mpz_clear(pubkeys[j].x);
+                    mpz_clear(pubkeys[j].y);
+                    free(initial_pks[j]);
+                }
+                free(pubkeys);
+                free(initial_pks);
+                exit(1);
+            }
             set_publickey(argv[i], &pubkeys[i]);
             generate_strpublickey(&pubkeys[i], true, initial_pks[i]);
         }
@@ -1876,6 +2575,25 @@ int main(int argc, char **argv)
         pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
         struct thread_args *args = malloc(num_threads * sizeof(struct thread_args));
         struct DivisionControl *div_ctrl = malloc(sizeof(struct DivisionControl));
+
+        if (!threads || !args || !div_ctrl)
+        {
+            printf("Failed to allocate memory for thread resources\n");
+            // Cleanup
+            for (int i = 0; i < num_pubkeys; i++)
+            {
+                mpz_clear(pubkeys[i].x);
+                mpz_clear(pubkeys[i].y);
+                free(initial_pks[i]);
+            }
+            free(pubkeys);
+            free(initial_pks);
+            free(threads);
+            free(args);
+            free(div_ctrl);
+            exit(1);
+        }
+
         initialize_division_control(div_ctrl);
 
         printf("Starting search with %d threads for %d public keys\n", num_threads, num_pubkeys);
@@ -1893,19 +2611,36 @@ int main(int argc, char **argv)
             args[i].initial_pks = initial_pks;
             args[i].div_ctrl = div_ctrl;
             args[i].metrics = &metrics;
+            args[i].chunk = NULL;
+            args[i].chunk_mutex = NULL;
 
             if (pthread_create(&threads[i], NULL, find_division_path_thread, &args[i]) != 0)
             {
                 printf("Failed to create thread %d\n", i);
+                // Cleanup
+                for (int j = 0; j < num_pubkeys; j++)
+                {
+                    mpz_clear(pubkeys[j].x);
+                    mpz_clear(pubkeys[j].y);
+                    free(initial_pks[j]);
+                }
+                free(pubkeys);
+                free(initial_pks);
+                free(threads);
+                free(args);
+                pthread_mutex_destroy(&div_ctrl->mutex);
+                free(div_ctrl);
                 exit(1);
             }
         }
 
+        // Wait for division path threads
         for (int i = 0; i < num_threads; i++)
         {
             pthread_join(threads[i], NULL);
         }
 
+        // Cleanup division path mode
         for (int i = 0; i < num_pubkeys; i++)
         {
             mpz_clear(pubkeys[i].x);
@@ -1920,6 +2655,7 @@ int main(int argc, char **argv)
         free(div_ctrl);
     }
 
+    // Final cleanup
     cleanup_bloom_filters();
     mpz_clear(EC.p);
     mpz_clear(EC.n);
@@ -1934,6 +2670,11 @@ int main(int argc, char **argv)
     mpz_clear(number);
     mpz_clear(inversemultiplier);
     pthread_mutex_destroy(&metrics.metrics_mutex);
+
+    if (storage)
+    {
+        cleanup_storage(storage);
+    }
 
     if (auto_subtraction_mode)
     {
