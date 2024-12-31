@@ -52,7 +52,7 @@ struct thread_args *thread_args_array = NULL;
 #define MAX_CHUNKS 100    // Support up to 10M keys total (100 * 100K)
 
 // Thread management
-#define MAX_THREADS 256
+#define MAX_THREADS 257
 #define THREAD_SLEEP_MICROSECONDS 100
 
 // Bloom filter configuration
@@ -1666,8 +1666,8 @@ int init_multi_bloom_from_file(const char *filename)
 
     // Determine number of threads based on CPU cores
     int num_threads = sysconf(_SC_NPROCESSORS_ONLN);
-    if (num_threads > 64)
-        num_threads = 64;
+    if (num_threads > 257)
+        num_threads = 257;
 
     // Calculate entries per thread
     size_t entry_size = search_file_info.is_binary ? COMPRESSED_PUBKEY_SIZE : HEX_PUBKEY_SIZE;
