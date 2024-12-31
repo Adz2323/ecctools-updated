@@ -60,7 +60,7 @@ g++ -std=c++17 seg.cpp -o seg -pthread
 g++ gen.cpp -o gen -std=c++17 
 make
 ```
-
+./keyhunt -m address -f 67.txt -r 1:2540BE400 -l compress -t 256 -p 10000000000
 ## keygen
 
 This tool generate one private and his address/publickey compressed and uncompressed at request.
