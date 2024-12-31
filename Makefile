@@ -82,6 +82,12 @@ run:
 	g++ -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -Ofast -ftree-vectorize -flto -std=c++11 -o run run.cpp keyhunt div
 	./run <input_pubkey> <target_pubkey>
 
+debug:
+	g++ -m64 -march=native -mtune=native -mssse3 -Wall -Wextra -g -std=c++11 -o DebugTest \
+		secp256k1/Int.cpp secp256k1/Point.cpp secp256k1/SECP256K1.cpp secp256k1/IntMod.cpp \
+		secp256k1/Random.cpp secp256k1/IntGroup.cpp hash/ripemd160.cpp hash/sha256.cpp \
+		hash/ripemd160_sse.cpp hash/sha256_sse.cpp util.c secp256k1/test.cpp
+
 # Clean target to remove build artifacts
 clean:
 	rm -f *.o Auto keydivision keymath keyhunt
