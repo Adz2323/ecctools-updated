@@ -31,6 +31,57 @@
 #define COMPRESSED_PUBKEY_SIZE 33
 #define HEX_PUBKEY_SIZE 66
 
+struct BatchBuffer
+{
+    Point *points;
+    Int *randoms;
+    char **pubKeyHexes;
+    char **decimalStrs;
+    Point *results;
+    Point *negPoints;
+
+    BatchBuffer(size_t size)
+    {
+        points = new Point[size];
+        randoms = new Int[size];
+        pubKeyHexes = new char *[size];
+        decimalStrs = new char *[size];
+        results = new Point[size];
+        negPoints = new Point[size];
+
+        for (size_t i = 0; i < size; i++)
+        {
+            pubKeyHexes[i] = nullptr;
+            decimalStrs[i] = nullptr;
+        }
+    }
+
+    ~BatchBuffer()
+    {
+        delete[] points;
+        delete[] randoms;
+        delete[] negPoints;
+        for (size_t i = 0; i < BATCH_SIZE; i++)
+        {
+            if (pubKeyHexes[i])
+                free(pubKeyHexes[i]);
+            if (decimalStrs[i])
+                free(decimalStrs[i]);
+        }
+        delete[] pubKeyHexes;
+        delete[] decimalStrs;
+        delete[] results;
+    }
+};
+
+struct BatchMultiplyArgs
+{
+    Point *points;
+    Int *scalars;
+    int start;
+    int end;
+};
+
 struct ThreadArgs
 {
     Point startPoint;
@@ -41,14 +92,6 @@ struct ThreadArgs
     uint64_t total_ops;
     double keys_per_second;
     time_t start_time;
-};
-
-struct BatchMultiplyArgs
-{
-    Point *points;
-    Int *scalars;
-    int start;
-    int end;
 };
 
 struct FileInfo
@@ -312,11 +355,9 @@ void cleanup_bloom_filters()
     if (bloom_initialized3)
         bloom_free(&bloom_filter3);
 }
-
 void *scalar_multiply_worker(void *arg)
 {
     BatchMultiplyArgs *args = (BatchMultiplyArgs *)arg;
-
     for (int i = args->start; i < args->end; i++)
     {
         args->points[i] = secp.ScalarMultiplication(secp.G, &args->scalars[i]);
@@ -324,7 +365,7 @@ void *scalar_multiply_worker(void *arg)
     return NULL;
 }
 
-/*void batch_scalar_multiplication(Point *points, Int *scalars, int count)
+void batch_scalar_multiplication(Point *points, Int *scalars, int count)
 {
     const int num_threads = 8;
     pthread_t threads[num_threads];
@@ -337,20 +378,14 @@ void *scalar_multiply_worker(void *arg)
         thread_args[i].scalars = scalars;
         thread_args[i].start = i * chunk;
         thread_args[i].end = (i == num_threads - 1) ? count : (i + 1) * chunk;
-        pthread_create(&threads[i], NULL, [](void *arg) -> void *
-                       {
-           BatchMultiplyArgs* args = (BatchMultiplyArgs*)arg;
-           for (int j = args->start; j < args->end; j++) {
-               args->points[j] = secp.ComputePublicKey(&args->scalars[j]);
-           }
-           return NULL; }, &thread_args[i]);
+        pthread_create(&threads[i], NULL, scalar_multiply_worker, &thread_args[i]);
     }
 
     for (int i = 0; i < num_threads; i++)
     {
         pthread_join(threads[i], NULL);
     }
-}*/
+}
 
 Int generate_random_range(Int &start, Int &end)
 {
@@ -381,52 +416,66 @@ Int generate_random_range(Int &start, Int &end)
 void *subtraction_worker(void *arg)
 {
     ThreadArgs *args = (ThreadArgs *)arg;
-    Point *batch_points = new Point[BATCH_SIZE];
-    Int *batch_randoms = new Int[BATCH_SIZE];
+    BatchBuffer buffer(BATCH_SIZE);
 
     while (args->running)
     {
+        // Generate batch of random values
         for (int i = 0; i < BATCH_SIZE; i++)
         {
-            batch_randoms[i] = generate_random_range(args->rangeStart, args->rangeEnd);
-            Point temp = secp.ScalarMultiplication(secp.G, &batch_randoms[i]);
-            Point neg = secp.Negation(temp);
-            Point result = secp.AddDirect(neg, args->startPoint); // Subtract from start point
+            buffer.randoms[i] = generate_random_range(args->rangeStart, args->rangeEnd);
+        }
 
-            char *resultHex = secp.GetPublicKeyHex(true, result);
-            char *decimalStr = batch_randoms[i].GetBase10();
+        // Perform batch scalar multiplication
+        batch_scalar_multiplication(buffer.points, buffer.randoms, BATCH_SIZE);
 
-            if (!resultHex || !decimalStr)
-            {
-                free(resultHex);
-                free(decimalStr);
+        // Calculate negations for all points
+        for (int i = 0; i < BATCH_SIZE; i++)
+        {
+            buffer.negPoints[i] = secp.Negation(buffer.points[i]);
+        }
+
+        // Perform batch point addition and check results
+        for (int i = 0; i < BATCH_SIZE; i++)
+        {
+            buffer.results[i] = secp.AddDirect(buffer.negPoints[i], args->startPoint);
+
+            // Clean up previous iteration's strings
+            if (buffer.pubKeyHexes[i])
+                free(buffer.pubKeyHexes[i]);
+            if (buffer.decimalStrs[i])
+                free(buffer.decimalStrs[i]);
+
+            buffer.pubKeyHexes[i] = secp.GetPublicKeyHex(true, buffer.results[i]);
+            buffer.decimalStrs[i] = buffer.randoms[i].GetBase10();
+
+            if (!buffer.pubKeyHexes[i] || !buffer.decimalStrs[i])
                 continue;
-            }
 
             args->total_ops++;
             double elapsed = difftime(time(NULL), args->start_time);
             args->keys_per_second = args->total_ops / (elapsed > 0 ? elapsed : 1);
 
             pthread_mutex_lock(&print_mutex);
-            printf("\r%s - %s | %.2f keys/s", resultHex, decimalStr, args->keys_per_second);
+            printf("\r%s - %s | %.2f keys/s",
+                   buffer.pubKeyHexes[i],
+                   buffer.decimalStrs[i],
+                   args->keys_per_second);
             fflush(stdout);
             pthread_mutex_unlock(&print_mutex);
 
-            if (bloom_initialized1 && triple_bloom_check(resultHex))
+            if (bloom_initialized1 && triple_bloom_check(buffer.pubKeyHexes[i]))
             {
                 pthread_mutex_lock(&print_mutex);
                 printf("\nMATCH FOUND!\n");
-                printf("Thread %d: %s - %s\n", args->thread_id, resultHex, decimalStr);
+                printf("Thread %d: %s - %s\n",
+                       args->thread_id,
+                       buffer.pubKeyHexes[i],
+                       buffer.decimalStrs[i]);
                 pthread_mutex_unlock(&print_mutex);
             }
-
-            free(resultHex);
-            free(decimalStr);
         }
     }
-
-    delete[] batch_points;
-    delete[] batch_randoms;
     return NULL;
 }
 
