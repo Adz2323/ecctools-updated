@@ -501,9 +501,7 @@ bool Secp256K1::EC(Point &p)
 
 Point Secp256K1::ScalarMultiplication(Point &P, Int *scalar, bool debug)
 {
-  if (debug)
-    printf("\nScalar value: %s\n", scalar->GetBase16());
-
+  // Handle zero scalar
   if (scalar->IsZero())
   {
     Point result;
@@ -511,7 +509,39 @@ Point Secp256K1::ScalarMultiplication(Point &P, Int *scalar, bool debug)
     return result;
   }
 
-  // Make a normalized copy of input point
+  // Use precomputed table for G point multiplication
+  if (P.equals(G))
+  {
+    int i = 0;
+    uint8_t b;
+    Point Q;
+    Q.Clear();
+
+    // Search first significant byte
+    for (i = 0; i < 32; i++)
+    {
+      b = scalar->GetByte(i);
+      if (b)
+        break;
+    }
+
+    // Set initial point if we found a nonzero byte
+    if (b)
+      Q = GTable[256 * i + (b - 1)];
+    i++;
+
+    // Process remaining bytes
+    for (; i < 32; i++)
+    {
+      b = scalar->GetByte(i);
+      if (b)
+        Q = Add2(Q, GTable[256 * i + (b - 1)]);
+    }
+    Q.Reduce();
+    return Q;
+  }
+
+  // For non-G points, use double and add method
   Point addend(P);
   addend.Reduce();
 
@@ -520,12 +550,8 @@ Point Secp256K1::ScalarMultiplication(Point &P, Int *scalar, bool debug)
 
   int bits = scalar->GetBitLength();
 
-  // Standard double-and-add algorithm
   for (int i = bits - 1; i >= 0; i--)
   {
-    if (debug)
-      printf("Processing bit %d: %d\n", i, scalar->GetBit(i));
-
     if (!result.isZero())
     {
       if (debug)
