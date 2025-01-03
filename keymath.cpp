@@ -15,14 +15,14 @@
 #include "bloom/bloom.h"
 #include "xxhash/xxhash.h"
 
-#define NUM_THREADS 16
+#define NUM_THREADS 2
 #define BATCH_SIZE 1024
 #define PUBKEY_CACHE_SIZE 10000
 
 // Bloom filter configuration
-#define MAX_ENTRIES1 10000000000
-#define MAX_ENTRIES2 8000000000
-#define MAX_ENTRIES3 6000000000
+#define MAX_ENTRIES1 100000000
+#define MAX_ENTRIES2 80000000
+#define MAX_ENTRIES3 60000000
 #define PUBKEY_PREFIX_LENGTH 6
 #define BLOOM1_FP_RATE 0.0001
 #define BLOOM2_FP_RATE 0.00001
@@ -30,6 +30,12 @@
 #define BUFFER_SIZE (1024 * 1024)
 #define COMPRESSED_PUBKEY_SIZE 33
 #define HEX_PUBKEY_SIZE 66
+
+Int BILLION;
+void InitBILLION()
+{
+    BILLION.SetBase10("1000000000"); // One billion
+}
 
 struct BatchBuffer
 {
@@ -74,6 +80,22 @@ struct BatchBuffer
     }
 };
 
+struct Fraction
+{
+    int numerator;
+    int denominator;
+};
+
+struct StepSubtractionState
+{
+    bool enabled;
+    Fraction step_fraction;
+    Int initial_value;
+    Point current_point;
+    Int current_value;
+    bool first_step;
+};
+
 struct BatchMultiplyArgs
 {
     Point *points;
@@ -81,7 +103,6 @@ struct BatchMultiplyArgs
     int start;
     int end;
 };
-
 struct ThreadArgs
 {
     Point startPoint;
@@ -92,6 +113,7 @@ struct ThreadArgs
     uint64_t total_ops;
     double keys_per_second;
     time_t start_time;
+    StepSubtractionState *step_state; // Added for step subtraction mode
 };
 
 struct FileInfo
@@ -125,6 +147,51 @@ struct bloom bloom_filter3;
 bool bloom_initialized1 = false;
 bool bloom_initialized2 = false;
 bool bloom_initialized3 = false;
+
+Fraction parse_fraction(const char *fraction_str)
+{
+    Fraction result = {0, 0};
+    char *str_copy = strdup(fraction_str);
+    char *delimiter = strchr(str_copy, '/');
+
+    if (!delimiter)
+    {
+        free(str_copy);
+        return result;
+    }
+
+    *delimiter = '\0';
+    result.numerator = atoi(str_copy);
+    result.denominator = atoi(delimiter + 1);
+    free(str_copy);
+
+    return result;
+}
+
+Int calculate_next_step_value(const Int &value, const Fraction &fraction)
+{
+    Int result;
+    result.Set((Int *)&value); // Fix: Cast to non-const Int*
+
+    // Multiply by numerator
+    Int num;
+    num.SetInt32(fraction.numerator);
+    result.Mult(&num); // Fix: Changed Mul to Mult
+
+    // Divide by denominator
+    Int den;
+    den.SetInt32(fraction.denominator);
+    result.Div(&den);
+
+    return result;
+}
+void initStepSubtractionState(StepSubtractionState &state, const Int &initialValue, const Point &startPoint)
+{
+    state.first_step = true;
+    state.current_point = startPoint;
+    state.initial_value.Set((Int *)&initialValue);
+    state.current_value.Set((Int *)&initialValue);
+}
 
 // Bloom filter functions
 uint64_t estimate_bloom_size(uint64_t items, double fp_rate)
@@ -417,61 +484,138 @@ void *subtraction_worker(void *arg)
 {
     ThreadArgs *args = (ThreadArgs *)arg;
     BatchBuffer buffer(BATCH_SIZE);
+    StepSubtractionState *step_state = (StepSubtractionState *)args->step_state;
 
-    while (args->running)
+    if (step_state && step_state->enabled)
     {
-        // Generate batch of random values
-        for (int i = 0; i < BATCH_SIZE; i++)
+        // Step subtraction mode
+        Point result = args->startPoint;
+        Int subtract_value(&args->rangeEnd); // Initialize with command line value
+
+        while (args->running)
         {
-            buffer.randoms[i] = generate_random_range(args->rangeStart, args->rangeEnd);
-        }
+            // Calculate point for subtraction
+            Int negValue;
+            negValue.Set(&subtract_value);
+            negValue.Neg();
+            Point negPoint = secp.ScalarMultiplication(secp.G, &negValue);
 
-        // Perform batch scalar multiplication
-        batch_scalar_multiplication(buffer.points, buffer.randoms, BATCH_SIZE);
+            // Add the negated point (effectively subtracting)
+            result = secp.AddDirect(result, negPoint);
 
-        // Calculate negations for all points
-        for (int i = 0; i < BATCH_SIZE; i++)
-        {
-            buffer.negPoints[i] = secp.Negation(buffer.points[i]);
-        }
-
-        // Perform batch point addition and check results
-        for (int i = 0; i < BATCH_SIZE; i++)
-        {
-            buffer.results[i] = secp.AddDirect(buffer.negPoints[i], args->startPoint);
-
-            // Clean up previous iteration's strings
-            if (buffer.pubKeyHexes[i])
-                free(buffer.pubKeyHexes[i]);
-            if (buffer.decimalStrs[i])
-                free(buffer.decimalStrs[i]);
-
-            buffer.pubKeyHexes[i] = secp.GetPublicKeyHex(true, buffer.results[i]);
-            buffer.decimalStrs[i] = buffer.randoms[i].GetBase10();
-
-            if (!buffer.pubKeyHexes[i] || !buffer.decimalStrs[i])
-                continue;
+            // Get the result
+            char *pubKeyHex = secp.GetPublicKeyHex(true, result);
+            char *decimalStr = subtract_value.GetBase10();
 
             args->total_ops++;
             double elapsed = difftime(time(NULL), args->start_time);
             args->keys_per_second = args->total_ops / (elapsed > 0 ? elapsed : 1);
 
             pthread_mutex_lock(&print_mutex);
-            printf("\r%s - %s | %.2f keys/s",
-                   buffer.pubKeyHexes[i],
-                   buffer.decimalStrs[i],
+            printf("\r\033[K"); // Clear line
+            printf("\rStep %llu: %s - %s | %.2f keys/s",
+                   (unsigned long long)args->total_ops,
+                   pubKeyHex,
+                   decimalStr,
                    args->keys_per_second);
             fflush(stdout);
+
+            if (bloom_initialized1 && triple_bloom_check(pubKeyHex))
+            {
+                printf("\nMATCH FOUND!\n");
+                printf("Step %llu: %s - %s\n",
+                       (unsigned long long)args->total_ops,
+                       pubKeyHex,
+                       decimalStr);
+            }
             pthread_mutex_unlock(&print_mutex);
 
-            if (bloom_initialized1 && triple_bloom_check(buffer.pubKeyHexes[i]))
+            // Calculate next subtraction value (fraction of previous value)
+            Int next_value;
+            Int numerator;
+            Int denominator;
+
+            numerator.SetInt32(step_state->step_fraction.numerator);
+            denominator.SetInt32(step_state->step_fraction.denominator);
+
+            next_value.Set(&subtract_value);
+            next_value.Mult(&numerator);
+            next_value.Div(&denominator);
+
+            subtract_value.Set(&next_value);
+
+            // Check if we should continue
+            Int billion;
+            billion.SetBase10("1000000000");
+            if (subtract_value.IsLower(&billion))
             {
                 pthread_mutex_lock(&print_mutex);
-                printf("\nMATCH FOUND!\n");
-                printf("Thread %d: %s - %s\n",
-                       args->thread_id,
+                printf("\nReached value below 1 billion. Stopping.\n");
+                pthread_mutex_unlock(&print_mutex);
+                args->running = false;
+            }
+
+            free(pubKeyHex);
+            free(decimalStr);
+            usleep(100000); // Small delay to prevent CPU overload
+        }
+    }
+    else
+    {
+        // Original random range mode
+        while (args->running)
+        {
+            // Generate batch of random values
+            for (int i = 0; i < BATCH_SIZE; i++)
+            {
+                buffer.randoms[i] = generate_random_range(args->rangeStart, args->rangeEnd);
+            }
+
+            // Perform batch scalar multiplication
+            batch_scalar_multiplication(buffer.points, buffer.randoms, BATCH_SIZE);
+
+            // Calculate negations for all points
+            for (int i = 0; i < BATCH_SIZE; i++)
+            {
+                buffer.negPoints[i] = secp.Negation(buffer.points[i]);
+            }
+
+            // Perform batch point addition and check results
+            for (int i = 0; i < BATCH_SIZE; i++)
+            {
+                buffer.results[i] = secp.AddDirect(buffer.negPoints[i], args->startPoint);
+
+                // Clean up previous iteration's strings
+                if (buffer.pubKeyHexes[i])
+                    free(buffer.pubKeyHexes[i]);
+                if (buffer.decimalStrs[i])
+                    free(buffer.decimalStrs[i]);
+
+                buffer.pubKeyHexes[i] = secp.GetPublicKeyHex(true, buffer.results[i]);
+                buffer.decimalStrs[i] = buffer.randoms[i].GetBase10();
+
+                if (!buffer.pubKeyHexes[i] || !buffer.decimalStrs[i])
+                    continue;
+
+                args->total_ops++;
+                double elapsed = difftime(time(NULL), args->start_time);
+                args->keys_per_second = args->total_ops / (elapsed > 0 ? elapsed : 1);
+
+                pthread_mutex_lock(&print_mutex);
+                printf("\r%s - %s | %.2f keys/s",
                        buffer.pubKeyHexes[i],
-                       buffer.decimalStrs[i]);
+                       buffer.decimalStrs[i],
+                       args->keys_per_second);
+                fflush(stdout);
+
+                if (bloom_initialized1 && triple_bloom_check(buffer.pubKeyHexes[i]))
+                {
+                    printf("\nMATCH FOUND!\n");
+                    printf("Thread %d: %s - %s\n",
+                           args->thread_id,
+                           buffer.pubKeyHexes[i],
+                           buffer.decimalStrs[i]);
+                }
                 pthread_mutex_unlock(&print_mutex);
             }
         }
@@ -497,27 +641,73 @@ void print_stats(const ThreadArgs *args, int num_threads)
 int main(int argc, char **argv)
 {
     secp.Init();
+    InitBILLION();
 
     if (argc < 4)
     {
-        printf("Usage: %s [-f bloom_file] <publickey> <range_start>:<range_end>\n", argv[0]);
+        printf("Usage: %s [-f bloom_file] [-s fraction] <publickey> - <initial_value>\n", argv[0]);
+        printf("   or: %s [-f bloom_file] <publickey> <range_start>:<range_end>\n", argv[0]);
+        printf("Example step mode: %s -f bloom.bin -s 1/4 023456...ABCD - 123456\n", argv[0]);
+        printf("Example range mode: %s -f bloom.bin 023456...ABCD 1:123456\n", argv[0]);
         return 1;
     }
 
+    // Parse command line options
     const char *bloom_file = NULL;
+    const char *fraction_str = NULL;
     bool has_bloom = false;
-    int arg_offset = 0;
+    bool step_mode = false;
+    int current_arg = 1;
+    const char *pubkey_arg = NULL;
+    const char *range_arg = NULL;
 
-    if (strcmp(argv[1], "-f") == 0)
-    {
-        if (argc < 6)
+    // Process all flags first
+    while (current_arg < argc - 2)
+    { // Leave at least 2 args for pubkey and range
+        if (strcmp(argv[current_arg], "-f") == 0 && current_arg + 1 < argc)
         {
-            printf("Error: Missing arguments after -f\n");
+            bloom_file = argv[current_arg + 1];
+            has_bloom = true;
+            current_arg += 2;
+        }
+        else if (strcmp(argv[current_arg], "-s") == 0 && current_arg + 1 < argc)
+        {
+            fraction_str = argv[current_arg + 1];
+            step_mode = true;
+            current_arg += 2;
+        }
+        else
+        {
+            break;
+        }
+    }
+
+    // Ensure we have enough arguments left for pubkey and range
+    if (current_arg >= argc - 1)
+    {
+        printf("Error: Missing required arguments after options\n");
+        return 1;
+    }
+
+    // Get pubkey and range arguments
+    pubkey_arg = argv[current_arg++];
+    range_arg = argv[current_arg];
+
+    // Initialize step subtraction state if needed
+    StepSubtractionState step_state = {0};
+    if (step_mode)
+    {
+        step_state.enabled = true;
+        step_state.step_fraction = parse_fraction(fraction_str);
+        if (step_state.step_fraction.numerator <= 0 ||
+            step_state.step_fraction.denominator <= 0)
+        {
+            printf("Error: Invalid fraction format. Use n/m format (e.g., 1/4)\n");
             return 1;
         }
-        bloom_file = argv[2];
-        has_bloom = true;
-        arg_offset = 2;
+        printf("Step mode enabled with fraction %d/%d\n",
+               step_state.step_fraction.numerator,
+               step_state.step_fraction.denominator);
     }
 
     Point startPoint;
@@ -525,29 +715,53 @@ int main(int argc, char **argv)
 
     // Parse the public key
     bool isCompressed;
-    char *pubKey = strdup(argv[1 + arg_offset]);
+    char *pubKey = strdup(pubkey_arg);
     if (!secp.ParsePublicKeyHex(pubKey, startPoint, isCompressed))
     {
         printf("Invalid public key format\n");
-        free(pubKey);
+        free(pubKey); // Don't forget to free the allocated memory
         return 1;
     }
-    free(pubKey);
+    free(pubKey); // Free after successful parsing
 
-    // Parse range
-    char *range_str = strdup(argv[3 + arg_offset]);
-    char *delimiter = strchr(range_str, ':');
-    if (!delimiter)
+    // Parse range based on mode
+    if (step_mode)
     {
-        printf("Invalid range format. Use start:end\n");
-        free(range_str);
-        return 1;
+        // For step mode, expect "-" followed by initial value
+        if (strcmp(range_arg, "-") == 0)
+        {
+            if (current_arg + 1 >= argc)
+            {
+                printf("Error: Missing initial value after '-'\n");
+                return 1;
+            }
+            // Get the value after the "-"
+            rangeStart.SetInt32(0); // Not used in step mode
+            rangeEnd.SetBase10(argv[current_arg + 1]);
+        }
+        else
+        {
+            printf("Error: Step mode requires '-' as range separator followed by initial value\n");
+            return 1;
+        }
     }
+    else
+    {
+        // Original mode with start:end range
+        char *range_ptr = strdup(range_arg);
+        char *delimiter = strchr(range_ptr, ':');
+        if (!delimiter)
+        {
+            printf("Invalid range format. Use start:end\n");
+            free(range_ptr);
+            return 1;
+        }
 
-    *delimiter = '\0';
-    rangeStart.SetBase10(range_str);
-    rangeEnd.SetBase10(delimiter + 1);
-    free(range_str);
+        *delimiter = '\0';
+        rangeStart.SetBase10(range_ptr);
+        rangeEnd.SetBase10(delimiter + 1);
+        free(range_ptr);
+    }
 
     // Initialize bloom filters if file provided
     if (has_bloom)
@@ -564,10 +778,16 @@ int main(int argc, char **argv)
     pthread_t threads[NUM_THREADS];
     ThreadArgs thread_args[NUM_THREADS];
 
-    printf("Starting subtraction with %d threads...\n", NUM_THREADS);
+    // Determine number of threads based on mode
+    int num_threads = step_mode ? 1 : NUM_THREADS;
+    printf("Starting %s with %d threads...\n",
+           step_mode ? "step subtraction" : "subtraction",
+           num_threads);
+
     bool init_error = false;
 
-    for (int i = 0; i < NUM_THREADS; i++)
+    // Initialize and start threads
+    for (int i = 0; i < num_threads; i++)
     {
         thread_args[i].startPoint = startPoint;
         thread_args[i].rangeStart = rangeStart;
@@ -577,6 +797,7 @@ int main(int argc, char **argv)
         thread_args[i].total_ops = 0;
         thread_args[i].keys_per_second = 0;
         thread_args[i].start_time = time(NULL);
+        thread_args[i].step_state = step_mode ? &step_state : NULL;
 
         int err = pthread_create(&threads[i], NULL, subtraction_worker, &thread_args[i]);
         if (err)
@@ -603,25 +824,28 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // Wait for user input to stop
-    printf("\nPress Enter to stop...\n");
-    getchar();
-
-    // Stop all threads
-    printf("\nStopping threads...\n");
-    for (int i = 0; i < NUM_THREADS; i++)
+    // Handle thread completion differently based on mode
+    if (!step_mode)
     {
-        thread_args[i].running = false;
+        // Original mode - wait for user input to stop
+        printf("\nPress Enter to stop...\n");
+        getchar();
+
+        printf("\nStopping threads...\n");
+        for (int i = 0; i < num_threads; i++)
+        {
+            thread_args[i].running = false;
+        }
     }
 
-    // Wait for threads to finish
-    for (int i = 0; i < NUM_THREADS; i++)
+    // Wait for all threads to complete
+    for (int i = 0; i < num_threads; i++)
     {
         pthread_join(threads[i], NULL);
     }
 
     // Print final statistics
-    print_stats(thread_args, NUM_THREADS);
+    print_stats(thread_args, num_threads);
 
     // Cleanup
     cleanup_bloom_filters();
