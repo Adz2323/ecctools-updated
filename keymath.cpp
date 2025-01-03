@@ -644,20 +644,30 @@ void *systematic_worker(void *arg)
     ThreadArgs *args = (ThreadArgs *)arg;
     SystematicState *state = (SystematicState *)args->systematic_state;
 
-    // Initialize starting values
     Point current_point = state->start_point;
     Int step_value;
-    step_value.Set(&args->rangeStart);
-
+    Int thread_step;
     Int total_subtracted;
-    total_subtracted.SetInt32(0);
+    Int num_threads;
+    Int thread_id;
 
-    // Initialize step reduction rate (0.5%)
+    total_subtracted.SetInt32(0);
+    num_threads.SetInt32(NUM_THREADS);
+    thread_id.SetInt32(args->thread_id);
+
+    // Thread-specific step calculation
+    step_value.Set(&args->rangeStart);
+    thread_step.Set(&step_value);
+    thread_step.Div(&num_threads);
+    thread_step.Mult(&thread_id);
+    step_value.Add(&thread_step);
+
     Int reduction_numerator;
     reduction_numerator.SetInt32(5);
     Int reduction_denominator;
     reduction_denominator.SetInt32(1000);
 
+    static pthread_mutex_t reset_mutex = PTHREAD_MUTEX_INITIALIZER;
     static int reset_count = 0;
     bool first_subtraction = true;
 
@@ -665,7 +675,7 @@ void *systematic_worker(void *arg)
     {
         if (first_subtraction)
         {
-            // First subtraction - always subtract initial value from original point
+            pthread_mutex_lock(&reset_mutex);
             Int neg_initial;
             neg_initial.Set(&args->rangeStart);
             neg_initial.Neg();
@@ -673,10 +683,10 @@ void *systematic_worker(void *arg)
             current_point = secp.AddDirect(state->start_point, neg_point);
             total_subtracted.Add(&args->rangeStart);
             first_subtraction = false;
+            pthread_mutex_unlock(&reset_mutex);
         }
         else
         {
-            // Subsequent subtractions
             Int neg_step;
             neg_step.Set(&step_value);
             neg_step.Neg();
@@ -685,23 +695,21 @@ void *systematic_worker(void *arg)
             total_subtracted.Add(&step_value);
         }
 
-        // Get current results
         char *pubkey = secp.GetPublicKeyHex(true, current_point);
         char *step_str = step_value.GetBase10();
         char *total_str = total_subtracted.GetBase10();
 
-        // Update stats
         args->total_ops++;
         double elapsed = difftime(time(NULL), args->start_time);
         args->keys_per_second = args->total_ops / (elapsed > 0 ? elapsed : 1);
 
-        // Print status with shortened pubkey
         pthread_mutex_lock(&print_mutex);
         char pubkey_short[9];
         strncpy(pubkey_short, pubkey, 8);
         pubkey_short[8] = '\0';
 
-        printf("\r[Reset #%d] %s... | Step: %s | Total: %s | %.2f k/s     ",
+        printf("\r[T%d|Reset %d] %s... | Step: %s | Total: %s | %.2f k/s     ",
+               args->thread_id,
                reset_count,
                pubkey_short,
                step_str,
@@ -709,11 +717,10 @@ void *systematic_worker(void *arg)
                args->keys_per_second);
         fflush(stdout);
 
-        // Check for match in bloom filters
         if (bloom_initialized1 && triple_bloom_check(pubkey))
         {
             printf("\nMATCH FOUND!\n");
-            printf("Public Key: %s\n", pubkey);
+            printf("Thread %d - Public Key: %s\n", args->thread_id, pubkey);
             printf("Step Size: %s\n", step_str);
             printf("Total Subtracted: %s\n", total_str);
             printf("Reset Count: %d\n", reset_count);
@@ -721,26 +728,22 @@ void *systematic_worker(void *arg)
             FILE *f = fopen("matches.txt", "a");
             if (f)
             {
-                fprintf(f, "Public Key: %s\nStep: %s\nTotal: %s\nReset: %d\n\n",
-                        pubkey, step_str, total_str, reset_count);
+                fprintf(f, "Thread %d - Public Key: %s\nStep: %s\nTotal: %s\nReset: %d\n\n",
+                        args->thread_id, pubkey, step_str, total_str, reset_count);
                 fclose(f);
             }
         }
         pthread_mutex_unlock(&print_mutex);
 
-        // Check if total exceeds range end
         if (total_subtracted.IsGreater(&args->rangeEnd))
         {
-            // Calculate 0.5% reduction of step value
+            pthread_mutex_lock(&reset_mutex);
             Int reduction;
             reduction.Set(&step_value);
             reduction.Mult(&reduction_numerator);
             reduction.Div(&reduction_denominator);
-
-            // Subtract the reduction from step value
             step_value.Sub(&reduction);
 
-            // Reset to starting point
             current_point = state->start_point;
             total_subtracted.SetInt32(0);
             reset_count++;
@@ -748,20 +751,23 @@ void *systematic_worker(void *arg)
 
             pthread_mutex_lock(&print_mutex);
             char *new_step = step_value.GetBase10();
-            printf("\nReset with new step value: %s (0.5%% reduction)\n", new_step);
+            printf("\nThread %d reset with step: %s\n", args->thread_id, new_step);
             free(new_step);
             pthread_mutex_unlock(&print_mutex);
+
+            pthread_mutex_unlock(&reset_mutex);
         }
+
+        // Increment step by thread count
+        Int thread_increment;
+        thread_increment.SetInt32(NUM_THREADS);
+        step_value.Add(&thread_increment);
 
         free(pubkey);
         free(step_str);
         free(total_str);
-        usleep(1000); // Small delay to prevent CPU overload
+        usleep(100);
     }
-
-    pthread_mutex_lock(&print_mutex);
-    printf("\nThread finished: Step value went below 1 billion or stopped\n");
-    pthread_mutex_unlock(&print_mutex);
 
     return NULL;
 }
@@ -788,10 +794,10 @@ int main(int argc, char **argv)
 
     if (argc < 4)
     {
-        printf("Usage: %s [-f bloom_file] [-s fraction] <publickey> - <range_start>:<range_end>\n", argv[0]);
+        printf("Usage: %s [-f bloom_file] [-s fraction] <publickey> - <value>\n", argv[0]);
         printf("   or: %s [-f bloom_file] [-b] <publickey> - <range_start>:<range_end>\n", argv[0]);
         printf("Example systematic mode: %s -f bloom.bin -b 02345...ABCD - 1000:2000\n", argv[0]);
-        printf("Example step mode: %s -f bloom.bin -s 1/4 02345...ABCD - 1000:2000\n", argv[0]);
+        printf("Example step mode: %s -f bloom.bin -s 1/4 02345...ABCD - 1000\n", argv[0]);
         return 1;
     }
 
@@ -865,7 +871,6 @@ int main(int argc, char **argv)
     Point startPoint;
     Int rangeStart, rangeEnd;
 
-    // Parse public key
     char *pubKey = strdup(pubkey_arg);
     bool isCompressed;
     if (!secp.ParsePublicKeyHex(pubKey, startPoint, isCompressed))
@@ -876,9 +881,9 @@ int main(int argc, char **argv)
     }
     free(pubKey);
 
-    // Parse range for systematic or step mode
     if (step_mode)
     {
+        // Step mode takes a single value
         if (strcmp(range_arg, "-") != 0 || current_arg + 1 >= argc)
         {
             printf("Error: Step mode requires format: - <value>\n");
@@ -887,11 +892,12 @@ int main(int argc, char **argv)
         rangeStart.SetInt32(0);
         rangeEnd.SetBase10(argv[current_arg + 1]);
     }
-    else if (systematic_mode)
+    else if (systematic_mode || strcmp(range_arg, "-") == 0)
     {
-        if (strcmp(range_arg, "-") != 0 || current_arg + 1 >= argc)
+        // Both systematic mode and default range mode can use start:end format
+        if (current_arg + 1 >= argc)
         {
-            printf("Error: Systematic mode requires format: - <range_start>:<range_end>\n");
+            printf("Error: Missing range after '-'\n");
             return 1;
         }
 
@@ -912,22 +918,19 @@ int main(int argc, char **argv)
             printf("Error: Invalid range values\n");
             return 1;
         }
+
+        if (!systematic_mode)
+        {
+            printf("Random mode enabled\nStart: %s\nEnd: %s\n", range_str, delimiter + 1);
+        }
     }
     else
     {
-        char *range_ptr = strdup(range_arg);
-        char *delimiter = strchr(range_ptr, ':');
-        if (!delimiter)
-        {
-            printf("Invalid range format. Use start:end\n");
-            free(range_ptr);
-            return 1;
-        }
-
-        *delimiter = '\0';
-        rangeStart.SetBase10(range_ptr);
-        rangeEnd.SetBase10(delimiter + 1);
-        free(range_ptr);
+        printf("Error: Invalid range format\n");
+        printf("Use: %s [-f bloom_file] [-s fraction] <publickey> - <value>\n", argv[0]);
+        printf("  or: %s [-f bloom_file] [-b] <publickey> - <start>:<end>\n", argv[0]);
+        printf("  or: %s [-f bloom_file] <publickey> - <start>:<end>\n", argv[0]);
+        return 1;
     }
 
     if (has_bloom)
@@ -943,7 +946,7 @@ int main(int argc, char **argv)
     pthread_t threads[NUM_THREADS];
     ThreadArgs thread_args[NUM_THREADS];
 
-    int num_threads = (step_mode || systematic_mode) ? 1 : NUM_THREADS;
+    int num_threads = NUM_THREADS;
 
     if (systematic_mode)
     {
@@ -956,8 +959,8 @@ int main(int argc, char **argv)
         pthread_mutex_init(&systematic_state->step_mutex, NULL);
         char *start_str = rangeStart.GetBase10();
         char *end_str = rangeEnd.GetBase10();
-        printf("Systematic mode enabled\nStart: %s\nEnd: %s\n",
-               start_str, end_str);
+        printf("Systematic mode enabled with %d threads\nStart: %s\nEnd: %s\n",
+               num_threads, start_str, end_str);
         free(start_str);
         free(end_str);
     }
