@@ -55,9 +55,13 @@ email: albertobsd@gmail.com
 #define MODE_PUB2RMD 4
 #define MODE_MINIKEYS 5
 #define MODE_VANITY 6
+#define MODE_SUBTRACT 7 
 
 #define PUBKEY_BUFFER_SIZE 10000 // Number of keys per batch
 #define NUM_BUFFERS 256          // One per thread
+// Subtract mode specific constants
+#define PUBKEY_PREFIX_LENGTH 6
+#define COMPRESSED_PUBKEY_SIZE 33
 
 #define SEARCH_UNCOMPRESS 0
 #define SEARCH_COMPRESS 1
@@ -230,11 +234,14 @@ bool forceReadFileXPoint(char *fileName);
 bool processOneVanity();
 
 bool initBloomFilter(struct bloom *bloom_arg, uint64_t items_bloom);
+bool init_bloom_filter_for_subtract(const char *filename);
+bool verify_pubkey_in_file(unsigned char *pubkey, int length);
 
 void writeFileIfNeeded(const char *fileName);
 
 void calcualteindex(int i, Int *key);
 #if defined(_WIN64) && !defined(__CYGWIN__)
+DWORD WINAPI thread_process_subtract(LPVOID vargp);
 DWORD WINAPI thread_process_vanity(LPVOID vargp);
 DWORD WINAPI thread_process_minikeys(LPVOID vargp);
 DWORD WINAPI thread_process(LPVOID vargp);
@@ -247,6 +254,7 @@ DWORD WINAPI thread_process_bsgs_levy(LPVOID vargp);
 DWORD WINAPI thread_bPload(LPVOID vargp);
 DWORD WINAPI thread_bPload_2blooms(LPVOID vargp);
 #else
+void *thread_process_subtract(void *vargp);
 void *thread_process_vanity(void *vargp);
 void *thread_process_minikeys(void *vargp);
 void *thread_process(void *vargp);
@@ -275,7 +283,7 @@ char *bit_range_str_min;
 char *bit_range_str_max;
 
 const char *bsgs_modes[6] = {"sequential", "backward", "both", "random", "dance", "levy"};
-const char *modes[7] = {"xpoint", "address", "bsgs", "rmd160", "pub2rmd", "minikeys", "vanity"};
+const char *modes[8] = {"xpoint", "address", "bsgs", "rmd160", "pub2rmd", "minikeys", "vanity", "subtract"};
 const char *cryptos[3] = {"btc", "eth", "all"};
 const char *publicsearch[3] = {"uncompress", "compress", "both"};
 const char *default_fileName = "addresses.txt";
@@ -322,6 +330,19 @@ uint64_t DEBUGCOUNT = 0x400;
 uint64_t u64range;
 
 Int OUTPUTSECONDS;
+
+// Subtract mode variables
+char* targetPubKeyStr = NULL;
+char* subtractStepStr = NULL;
+Point targetPubKey;
+Int subtractStep;
+bool subtractStepProvided = false;
+struct bloom bloom_subtract; // Separate bloom filter for subtract mode
+bool bloom_subtract_initialized = false;
+
+// For secondary verification in subtract mode
+char subtract_file_path[1024] = {0};
+bool subtract_file_is_binary = false;
 
 int FLAGSKIPCHECKSUM = 0;
 int FLAGENDOMORPHISM = 0;
@@ -533,11 +554,18 @@ int main(int argc, char **argv)
 
     printf("[+] Version %s, developed by AlbertoBSD\n", version);
 
-    while ((c = getopt(argc, argv, "deh6MqRSB:b:c:C:E:f:I:k:L:l:m:N:n:p:r:s:t:v:G:8:z:")) != -1)
+    while ((c = getopt(argc, argv, "deh6MqRSB:b:c:C:E:f:I:k:L:l:m:N:n:p:r:s:t:v:G:8:z:P:V:")) != -1)
     {
         switch (c)
         {
-        case 'L': // Add this to getopt string
+            case 'P':
+    targetPubKeyStr = optarg;
+    break;
+case 'V':
+    subtractStepStr = optarg;
+    subtractStepProvided = true;
+    break;
+        case 'L':
             LEVY_ALPHA = strtod(optarg, NULL);
             if (LEVY_ALPHA <= 1.0 || LEVY_ALPHA > 2.0)
             {
@@ -682,8 +710,13 @@ int main(int argc, char **argv)
             printf("[+] Matrix screen\n");
             break;
         case 'm':
-            switch (indexOf(optarg, modes, 7))
+            switch (indexOf(optarg, modes, 8))
             {
+                case MODE_SUBTRACT:
+    FLAGMODE = MODE_SUBTRACT;
+    printf("[+] Mode subtract\n");
+    FLAGCRYPTO = CRYPTO_BTC; // Default to BTC
+    break;
             case MODE_XPOINT:
                 FLAGMODE = MODE_XPOINT;
                 printf("[+] Mode xpoint\n");
@@ -980,6 +1013,66 @@ int main(int argc, char **argv)
         }
     }
     N = 0;
+
+    // Setup for subtract mode
+if (FLAGMODE == MODE_SUBTRACT) {
+    // Check required parameters
+    if (targetPubKeyStr == NULL) {
+        fprintf(stderr, "[E] Subtract mode requires a target public key (-P option)\n");
+        exit(EXIT_FAILURE);
+    }
+    
+    printf("[+] Target public key: %s\n", targetPubKeyStr);
+    
+    // Parse target public key
+    bool isCompressed;
+    if (!secp->ParsePublicKeyHex(targetPubKeyStr, targetPubKey, isCompressed)) {
+        fprintf(stderr, "[E] Failed to parse target public key\n");
+        exit(EXIT_FAILURE);
+    }
+    
+    // Parse subtract step if provided
+    if (subtractStepProvided) {
+        if (subtractStepStr[0] == '0' && subtractStepStr[1] == 'x') {
+            // Handle 0x prefix for hex
+            subtractStep.SetBase16(subtractStepStr + 2);
+        } else {
+            // Try to parse as hex directly
+            subtractStep.SetBase16(subtractStepStr);
+        }
+        
+        printf("[+] Using step value: ");
+        char* stepHex = subtractStep.GetBase16();
+        printf("%s\n", stepHex);
+        free(stepHex);
+    } else {
+        // When no step is provided, default to stride of 1
+        subtractStep.SetInt32(1);
+        printf("[+] No step value provided, using default: 1\n");
+    }
+    
+    // Initialize range for subtract mode if not already set
+    if (!FLAGRANGE && !FLAGBITRANGE) {
+        n_range_start.SetInt32(1);
+        n_range_end.Set(&secp->order);
+        n_range_diff.Set(&n_range_end);
+        n_range_diff.Sub(&n_range_start);
+        printf("[+] Using full range for subtraction\n");
+    }
+    
+    // Load bloom filter from file
+    if (FLAGFILE == 0) {
+        fprintf(stderr, "[E] Subtract mode requires a bloom filter file (-f option)\n");
+        exit(EXIT_FAILURE);
+    }
+    
+    // Use optimized bloom filter loading for subtract mode
+    printf("[+] Loading bloom filter for subtract mode\n");
+    if (!init_bloom_filter_for_subtract(fileName)) {
+        fprintf(stderr, "[E] Failed to load bloom filter from file\n");
+        exit(EXIT_FAILURE);
+    }
+}
 
     if (FLAGMODE != MODE_BSGS)
     {
@@ -2383,31 +2476,37 @@ int main(int argc, char **argv)
             steps[j] = 0;
             s = 0;
             switch (FLAGMODE)
-            {
+{
 #if defined(_WIN64) && !defined(__CYGWIN__)
-            case MODE_ADDRESS:
-            case MODE_XPOINT:
-            case MODE_RMD160:
-                tid[j] = CreateThread(NULL, 0, thread_process, (void *)tt, 0, &s);
-                break;
-            case MODE_MINIKEYS:
-                tid[j] = CreateThread(NULL, 0, thread_process_minikeys, (void *)tt, 0, &s);
-                break;
-            case MODE_VANITY:
-                tid[j] = CreateThread(NULL, 0, thread_process_vanity, (void *)tt, 0, &s);
-                break;
+    case MODE_ADDRESS:
+    case MODE_XPOINT:
+    case MODE_RMD160:
+        tid[j] = CreateThread(NULL, 0, thread_process, (void *)tt, 0, &s);
+        break;
+    case MODE_MINIKEYS:
+        tid[j] = CreateThread(NULL, 0, thread_process_minikeys, (void *)tt, 0, &s);
+        break;
+    case MODE_VANITY:
+        tid[j] = CreateThread(NULL, 0, thread_process_vanity, (void *)tt, 0, &s);
+        break;
+    case MODE_SUBTRACT:
+        tid[j] = CreateThread(NULL, 0, thread_process_subtract, (void *)tt, 0, &s);
+        break;
 #else
-            case MODE_ADDRESS:
-            case MODE_XPOINT:
-            case MODE_RMD160:
-                s = pthread_create(&tid[j], NULL, thread_process, (void *)tt);
-                break;
-            case MODE_MINIKEYS:
-                s = pthread_create(&tid[j], NULL, thread_process_minikeys, (void *)tt);
-                break;
-            case MODE_VANITY:
-                s = pthread_create(&tid[j], NULL, thread_process_vanity, (void *)tt);
-                break;
+    case MODE_ADDRESS:
+    case MODE_XPOINT:
+    case MODE_RMD160:
+        s = pthread_create(&tid[j], NULL, thread_process, (void *)tt);
+        break;
+    case MODE_MINIKEYS:
+        s = pthread_create(&tid[j], NULL, thread_process_minikeys, (void *)tt);
+        break;
+    case MODE_VANITY:
+        s = pthread_create(&tid[j], NULL, thread_process_vanity, (void *)tt);
+        break;
+    case MODE_SUBTRACT:
+        s = pthread_create(&tid[j], NULL, thread_process_subtract, (void *)tt);
+        break;
 #endif
             }
             if (s != 0)
@@ -2659,9 +2758,86 @@ int main(int argc, char **argv)
         free(bit_range_str_max);
     }
 
+    // Clean up subtract mode resources
+if (FLAGMODE == MODE_SUBTRACT && bloom_subtract_initialized) {
+    bloom_free(&bloom_subtract);
+}
+
     delete secp;
 
     return 0;
+}
+
+bool verify_pubkey_in_file(unsigned char *pubkey, int length) {
+    // If we don't have a file path saved, skip verification
+    if (subtract_file_path[0] == 0) {
+        return true; // Assume it's a match
+    }
+    
+    FILE *file = fopen(subtract_file_path, "rb");
+    if (!file) {
+        return true; // Can't verify, assume it's a match
+    }
+    
+    bool found = false;
+    const size_t BUFFER_SIZE = 1024 * 1024; // 1MB buffer
+    unsigned char *buffer = (unsigned char *)malloc(BUFFER_SIZE);
+    
+    if (!buffer) {
+        fclose(file);
+        return true; // Can't verify, assume it's a match
+    }
+    
+    if (subtract_file_is_binary) {
+        // Binary file verification
+        size_t bytesRead = 0;
+        while (!found && (bytesRead = fread(buffer, 1, BUFFER_SIZE, file)) > 0) {
+            size_t entriesInBuffer = bytesRead / 33; // 33 bytes per compressed pubkey
+            
+            for (size_t i = 0; i < entriesInBuffer; i++) {
+                unsigned char* pubkeyData = buffer + (i * 33);
+                
+                // Compare pubkeys - for compressed keys, compare prefix and X coordinate
+                if (pubkey[0] == pubkeyData[0] && // Same compression prefix
+                    memcmp(pubkey + 1, pubkeyData + 1, 32) == 0) { // Same X coordinate
+                    found = true;
+                    break;
+                }
+            }
+        }
+    } else {
+        // Text file verification
+        char line[150];
+        
+        while (!found && fgets(line, sizeof(line), file) != NULL) {
+            size_t len = strlen(line);
+            
+            // Remove newline
+            if (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
+                line[--len] = 0;
+            
+            if (len >= 66) {
+                // Compressed public key in hex format
+                if (line[0] == '0' && (line[1] == '2' || line[1] == '3')) {
+                    unsigned char binPubkey[33];
+                    
+                    // Convert hex to binary
+                    if (hexs2bin(line, binPubkey)) {
+                        // Compare pubkeys
+                        if (pubkey[0] == binPubkey[0] && // Same compression prefix
+                            memcmp(pubkey + 1, binPubkey + 1, 32) == 0) { // Same X coordinate
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    free(buffer);
+    fclose(file);
+    return found;
 }
 
 void init_pubkey_buffers()
@@ -3158,6 +3334,196 @@ void *thread_process_minikeys(void *vargp)
     } while (continue_flag);
     return NULL;
 }
+
+#if defined(_WIN64) && !defined(__CYGWIN__)
+DWORD WINAPI thread_process_subtract(LPVOID vargp)
+{
+#else
+void *thread_process_subtract(void *vargp)
+{
+#endif
+    struct tothread *tt = (struct tothread *)vargp;
+    int thread_number = tt->nt;
+    free(tt);
+
+    Int base_key, subtractValue, offset;
+    Point pointToSubtract, startP;
+    IntGroup grp(CPU_GRP_SIZE / 2 + 1);
+    Int dx[CPU_GRP_SIZE / 2 + 2];
+    Point pts[CPU_GRP_SIZE];
+
+    int i, hLength = (CPU_GRP_SIZE / 2 - 1);
+    unsigned char binPubKey[33];
+    char xpoint_raw[32];
+    uint32_t r;
+    uint64_t totalProcessed = 0;
+    time_t startTime = time(NULL);
+    bool continue_flag = true;
+
+    while (continue_flag) {
+        // Thread-safe range access
+        #if defined(_WIN64) && !defined(__CYGWIN__)
+        WaitForSingleObject(write_random, INFINITE);
+        #else
+        pthread_mutex_lock(&write_random);
+        #endif
+
+        subtractValue.Set(&n_range_start);
+        Int step;
+        step.Set(&subtractStep);
+        step.Mult(thread_number);
+        subtractValue.Add(&step);
+
+        Int nextStep;
+        nextStep.Set(&subtractStep);
+        nextStep.Mult(NTHREADS);
+        n_range_start.Add(&nextStep);
+
+        #if defined(_WIN64) && !defined(__CYGWIN__)
+        ReleaseMutex(write_random);
+        #else
+        pthread_mutex_unlock(&write_random);
+        #endif
+
+        if (subtractValue.IsGreater(&n_range_end)) {
+            break;
+        }
+
+        // Compute subtraction point: target - (priv * G)
+        pointToSubtract = secp->ComputePublicKey(&subtractValue);
+        pointToSubtract.y.ModNeg();
+        startP = secp->AddDirect(targetPubKey, pointToSubtract);
+
+        // Output current subtraction value + resulting pubkey
+        unsigned char centerPubKey[33];
+        startP.x.Get32Bytes(centerPubKey + 1);
+        centerPubKey[0] = startP.y.IsEven() ? 0x02 : 0x03;
+
+        char hexOut[67];
+        for (int j = 0; j < 33; j++) {
+            sprintf(hexOut + j * 2, "%02x", centerPubKey[j]);
+        }
+        hexOut[66] = '\0';
+
+        char *subtractHex = subtractValue.GetBase16();
+        printf("\rSubVal: %s | PubKey: %s     \r", subtractHex, hexOut);
+        fflush(stdout);
+        free(subtractHex);
+
+        // Batch setup
+        for (i = 0; i < hLength; i++) {
+            dx[i].ModSub(&Gn[i].x, &startP.x);
+        }
+        dx[i].ModSub(&Gn[i].x, &startP.x);
+        dx[i + 1].ModSub(&_2Gn.x, &startP.x);
+
+        grp.Set(dx);
+        grp.ModInv();
+
+        pts[CPU_GRP_SIZE / 2] = startP;
+
+        for (i = 0; i < hLength; i++) {
+            Point pp = startP, pn = startP;
+            Int dy, s, p;
+
+            // +i*G
+            dy.ModSub(&Gn[i].y, &pp.y);
+            s.ModMulK1(&dy, &dx[i]);
+            p.ModSquareK1(&s);
+            pp.x.ModNeg(); pp.x.ModAdd(&p); pp.x.ModSub(&Gn[i].x);
+            Int tmp;
+            tmp.ModSub(&Gn[i].x, &pp.x);
+            pp.y.ModMulK1(&tmp, &s); pp.y.ModSub(&Gn[i].y);
+            pp.z.SetInt32(1);
+
+            // -i*G
+            dy.Set(&Gn[i].y); dy.ModNeg(); dy.ModSub(&pn.y);
+            s.ModMulK1(&dy, &dx[i]);
+            p.ModSquareK1(&s);
+            pn.x.ModNeg(); pn.x.ModAdd(&p); pn.x.ModSub(&Gn[i].x);
+            tmp.ModSub(&Gn[i].x, &pn.x);
+            pn.y.ModMulK1(&tmp, &s); pn.y.ModSub(&Gn[i].y);
+            pn.z.SetInt32(1);
+
+            pts[CPU_GRP_SIZE / 2 + (i + 1)] = pp;
+            pts[CPU_GRP_SIZE / 2 - (i + 1)] = pn;
+        }
+
+        // Edge point
+        Point edge = startP;
+        Int dy, s, p;
+        dy.Set(&Gn[i].y); dy.ModNeg(); dy.ModSub(&edge.y);
+        s.ModMulK1(&dy, &dx[i]);
+        p.ModSquareK1(&s);
+        edge.x.ModNeg(); edge.x.ModAdd(&p); edge.x.ModSub(&Gn[i].x);
+        Int tmp;
+        tmp.ModSub(&Gn[i].x, &edge.x);
+        edge.y.ModMulK1(&tmp, &s); edge.y.ModSub(&Gn[i].y);
+        edge.z.SetInt32(1);
+
+        pts[0] = edge;
+
+        // Bloom + verify
+        for (i = 0; i < CPU_GRP_SIZE; i++) {
+            pts[i].x.Get32Bytes((unsigned char *)xpoint_raw);
+            binPubKey[0] = pts[i].y.IsEven() ? 0x02 : 0x03;
+            memcpy(binPubKey + 1, xpoint_raw, 32);
+
+            r = bloom_check(&bloom_subtract, xpoint_raw, 32);
+            if (r && verify_pubkey_in_file(binPubKey, 33)) {
+                Int keyfound;
+                keyfound.Set(&subtractValue);
+                offset.SetInt32(i - CPU_GRP_SIZE / 2);
+                keyfound.Add(&offset);
+
+                char *privHex = keyfound.GetBase16();
+                Point matchPub = secp->ComputePublicKey(&keyfound);
+                char *pubHex = secp->GetPublicKeyHex(true, matchPub);
+
+                #if defined(_WIN64) && !defined(__CYGWIN__)
+                WaitForSingleObject(write_keys, INFINITE);
+                #else
+                pthread_mutex_lock(&write_keys);
+                #endif
+
+                FILE *filekey = fopen("KEYFOUNDKEYFOUND.txt", "a");
+                if (filekey) {
+                    fprintf(filekey, "Subtract Value Found: %s\nResulting Pubkey: %s\n\n", privHex, pubHex);
+                    fclose(filekey);
+                }
+
+                printf("\nSubtract Value Found: %s\nResulting Pubkey: %s\n", privHex, pubHex);
+
+                #if defined(_WIN64) && !defined(__CYGWIN__)
+                ReleaseMutex(write_keys);
+                #else
+                pthread_mutex_unlock(&write_keys);
+                #endif
+
+                free(privHex);
+                free(pubHex);
+
+                continue_flag = false;
+                break;
+            }
+        }
+
+        totalProcessed += CPU_GRP_SIZE;
+    }
+
+    if (!FLAGQUIET) {
+        time_t endTime = time(NULL);
+        double elapsed = difftime(endTime, startTime);
+        double rate = (elapsed > 0) ? totalProcessed / elapsed : 0;
+        printf("\nProcessed %" PRIu64 " keys in %.1f seconds (%.2f keys/s)\n",
+               totalProcessed, elapsed, rate);
+    }
+
+    ends[thread_number] = 1;
+    return NULL;
+}
+
+
 
 #if defined(_WIN64) && !defined(__CYGWIN__)
 DWORD WINAPI thread_process(LPVOID vargp)
@@ -7055,6 +7421,9 @@ void menu()
     printf("-t tn       Threads number, must be a positive integer\n");
     printf("-v value    Search for vanity Address, only with -m vanity\n");
     printf("-z value    Bloom size multiplier, only address,rmd160,vanity, xpoint, value >= 1\n");
+    printf("-m subtract     Subtract mode - subtract values from a target public key\n");
+printf("-P pubkey       Target public key to subtract from (in hex format)\n");
+printf("-V step_value   Step value for subtraction (hex format)\n");
     printf("\nExample:\n\n");
     printf("./keyhunt -m rmd160 -f tests/unsolvedpuzzles.rmd -b 66 -l compress -R -q -t 8\n\n");
     printf("This line runs the program with 8 threads from the range 20000000000000000 to 40000000000000000 without stats output\n\n");
@@ -7998,6 +8367,249 @@ bool forceReadFileXPoint(char *fileName)
 /*
     I write this as a function because i have the same segment of code in 3 different functions
 */
+
+bool init_bloom_filter_for_subtract(const char *filename) {
+    FILE *file = fopen(filename, "rb");
+    if (!file) {
+        fprintf(stderr, "[E] Failed to open bloom filter file: %s\n", filename);
+        return false;
+    }
+    
+    // Check if file is binary (contains compressed keys)
+    unsigned char buf[4];
+    size_t read = fread(buf, 1, 4, file);
+    bool is_binary = (read >= 1 && (buf[0] == 0x02 || buf[0] == 0x03));
+    fseek(file, 0, SEEK_SET);
+    
+    // Get file size for progress reporting
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    
+    // Calculate estimated entries
+    uint64_t total_entries;
+    if (is_binary) {
+        total_entries = file_size / 33; // Compressed pubkey size
+    } else {
+        // For text files, estimate based on average line length
+        total_entries = file_size / 67; // 66 chars + newline
+    }
+    
+    printf("[+] Loading bloom filter from %s\n", filename);
+    printf("[+] File type: %s\n", is_binary ? "Binary" : "Text");
+    printf("[+] Estimated entries: %" PRIu64 "\n", total_entries);
+    
+    // Apply bloom filter multiplier if set
+    total_entries *= FLAGBLOOMMULTIPLIER;
+    
+    // Calculate available system memory (approximate method)
+    uint64_t available_ram = 0;
+    #if defined(_WIN64) && !defined(__CYGWIN__)
+    MEMORYSTATUSEX memInfo;
+    memInfo.dwLength = sizeof(MEMORYSTATUSEX);
+    GlobalMemoryStatusEx(&memInfo);
+    available_ram = memInfo.ullAvailPhysMem;
+    #else
+    // Linux/Unix systems
+    FILE* meminfo = fopen("/proc/meminfo", "r");
+    if (meminfo) {
+        char line[128];
+        while (fgets(line, sizeof(line), meminfo)) {
+            if (strncmp(line, "MemAvailable:", 13) == 0) {
+                uint64_t kb_available;
+                sscanf(line + 13, "%" PRIu64, &kb_available);
+                available_ram = kb_available * 1024; // Convert KB to bytes
+                break;
+            }
+        }
+        fclose(meminfo);
+    }
+    #endif
+    
+    // If we couldn't determine available RAM, assume a conservative amount
+    if (available_ram == 0) {
+        available_ram = 8ULL * 1024 * 1024 * 1024; // 8 GB default
+    }
+    
+    double available_ram_gb = (double)available_ram / (1024.0 * 1024.0 * 1024.0);
+    printf("[+] Available system memory: %.2f GB\n", available_ram_gb);
+    
+    // Calculate optimal error rate based on available memory
+    // We'll use up to 70% of available RAM for the bloom filter
+    uint64_t max_bytes_to_use = (uint64_t)(available_ram * 0.7);
+    
+    // Calculate bits needed per element for different error rates
+    double error_rates[] = {0.000001, 0.0000001, 0.00000001, 0.000000001};
+    printf("[+] Error rate options for bloom filter:\n");
+    
+    for (int i = 0; i < sizeof(error_rates)/sizeof(error_rates[0]); i++) {
+        double error_rate = error_rates[i];
+        uint64_t bits_needed = (uint64_t)(-1.0 * total_entries * log(error_rate) / (log(2.0) * log(2.0)));
+        uint64_t bytes_needed = (bits_needed + 7) / 8; // Round up to nearest byte
+        double mb_needed = (double)bytes_needed / (1024.0 * 1024.0);
+        double gb_needed = mb_needed / 1024.0;
+        
+        printf("    Error rate: %g -> Memory: ", error_rate);
+        if (gb_needed >= 1.0) {
+            printf("%.2f GB\n", gb_needed);
+        } else {
+            printf("%.2f MB\n", mb_needed);
+        }
+    }
+    
+    // Choose the lowest error rate that fits in our memory budget
+    double chosen_error_rate = error_rates[0]; // Start with highest error rate
+    uint64_t chosen_bits_needed = 0;
+    uint64_t chosen_bytes_needed = 0;
+    
+    for (int i = sizeof(error_rates)/sizeof(error_rates[0]) - 1; i >= 0; i--) {
+        double error_rate = error_rates[i];
+        uint64_t bits_needed = (uint64_t)(-1.0 * total_entries * log(error_rate) / (log(2.0) * log(2.0)));
+        uint64_t bytes_needed = (bits_needed + 7) / 8; // Round up to nearest byte
+        
+        if (bytes_needed <= max_bytes_to_use) {
+            chosen_error_rate = error_rate;
+            chosen_bits_needed = bits_needed;
+            chosen_bytes_needed = bytes_needed;
+            break;
+        }
+    }
+    
+    double chosen_mb_needed = (double)chosen_bytes_needed / (1024.0 * 1024.0);
+    double chosen_gb_needed = chosen_mb_needed / 1024.0;
+    
+    printf("[+] Selected error rate: %g\n", chosen_error_rate);
+    if (chosen_gb_needed >= 1.0) {
+        printf("[+] Estimated memory usage: %.2f GB\n", chosen_gb_needed);
+    } else {
+        printf("[+] Estimated memory usage: %.2f MB\n", chosen_mb_needed);
+    }
+    
+    // Ask for confirmation if large memory requirement
+    if (chosen_gb_needed > 4.0) {
+        printf("[!] Warning: Large memory requirement detected.\n");
+        printf("    Continue? (y/n): ");
+        char response = getchar();
+        if (response != 'y' && response != 'Y') {
+            printf("[+] Operation cancelled by user\n");
+            fclose(file);
+            return false;
+        }
+        // Clear input buffer
+        while (getchar() != '\n');
+    }
+    
+    // Initialize bloom filter with calculated parameters
+    printf("[+] Initializing bloom filter...\n");
+    
+    if (bloom_init2(&bloom_subtract, total_entries, chosen_error_rate) != 0) {
+        fprintf(stderr, "[E] Failed to initialize bloom filter\n");
+        fclose(file);
+        return false;
+    }
+    
+    bloom_subtract_initialized = true;
+    
+    // Store original file info for secondary verification
+    if (is_binary) {
+        // Keep track of the original file for secondary verification
+        strcpy(subtract_file_path, filename);
+        subtract_file_is_binary = true;
+    }
+    
+    // Use a large buffer for improved disk I/O
+    const size_t BUFFER_SIZE = 1024 * 1024; // 1MB buffer
+    unsigned char *buffer = (unsigned char *)malloc(BUFFER_SIZE);
+    if (!buffer) {
+        fprintf(stderr, "[E] Failed to allocate buffer memory\n");
+        fclose(file);
+        return false;
+    }
+    
+    size_t bytesRead = 0;
+    size_t entriesProcessed = 0;
+    size_t lastPercent = 0;
+    
+    // Start timing
+    time_t startTime = time(NULL);
+    
+    if (is_binary) {
+        // Process binary file more efficiently in batches
+        while ((bytesRead = fread(buffer, 1, BUFFER_SIZE, file)) > 0) {
+            size_t entriesInBuffer = bytesRead / 33; // 33 bytes per compressed pubkey
+            
+            for (size_t i = 0; i < entriesInBuffer; i++) {
+                unsigned char* pubkeyData = buffer + (i * 33);
+                
+                // Add to bloom filter (only the X coordinate, skipping the 02/03 byte)
+                bloom_add(&bloom_subtract, (char*)(pubkeyData + 1), 32);
+            }
+            
+            entriesProcessed += entriesInBuffer;
+            
+            // Show progress less frequently to reduce I/O overhead
+            size_t percentComplete = (entriesProcessed * 100) / total_entries;
+            if (percentComplete > lastPercent) {
+                printf("\rLoading bloom filter: %zu%% complete   ", percentComplete);
+                fflush(stdout);
+                lastPercent = percentComplete;
+            }
+        }
+    } else {
+        // Text file processing
+        char line[150];
+        
+        while (fgets((char*)buffer, BUFFER_SIZE, file) != NULL) {
+            size_t len = strlen((char*)buffer);
+            
+            // Remove newline
+            if (len > 0 && (buffer[len-1] == '\n' || buffer[len-1] == '\r'))
+                buffer[--len] = 0;
+            
+            if (len >= 66) {
+                // Compressed public key in hex format
+                if (buffer[0] == '0' && (buffer[1] == '2' || buffer[1] == '3')) {
+                    unsigned char binPubkey[33];
+                    
+                    // Convert hex to binary
+                    if (hexs2bin((char*)buffer, binPubkey)) {
+                        // Add to bloom filter (only the X coordinate, skipping the 02/03 byte)
+                        bloom_add(&bloom_subtract, (char*)(binPubkey + 1), 32);
+                        entriesProcessed++;
+                    }
+                }
+            }
+            
+            // Show progress less frequently
+            if (entriesProcessed % 10000 == 0) {
+                size_t percentComplete = (ftell(file) * 100) / file_size;
+                if (percentComplete > lastPercent) {
+                    printf("\rLoading bloom filter: %zu%% complete   ", percentComplete);
+                    fflush(stdout);
+                    lastPercent = percentComplete;
+                }
+            }
+        }
+    }
+    
+    // End timing
+    time_t endTime = time(NULL);
+    double duration = difftime(endTime, startTime);
+    
+    printf("\rBloom filter loaded: 100%% complete   \n");
+    printf("Time taken: %.1f seconds\n", duration);
+    
+    // Display bloom filter stats
+    printf("Bloom filter: %" PRIu64 " entries, %.9Lf error rate, %.2f MB\n", 
+           bloom_subtract.entries, bloom_subtract.error, (double)bloom_subtract.bytes / 1024 / 1024);
+    printf("With this error rate, expect approximately 1 false positive per %.0f subtractions\n",
+           1.0 / (double)chosen_error_rate);
+    
+    // Clean up
+    free(buffer);
+    fclose(file);
+    return true;
+}
 
 bool initBloomFilter(struct bloom *bloom_arg, uint64_t items_bloom)
 {
