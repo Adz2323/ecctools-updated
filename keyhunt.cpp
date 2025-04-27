@@ -241,6 +241,11 @@ bool parse_target_subtract_keys();
 bool init_subtract_bloom_filter(const char *filename);
 bool init_subtract_bloom_filter(const char *filename);
 uint64_t estimate_subtract_bloom_size(uint64_t items, double fp_rate);
+void calculate_prime_stride(Int &range_diff, Int &current_prime_int, Int &stride);
+uint64_t next_prime(uint64_t n);
+bool is_prime(uint64_t n);
+
+
 
 #if defined(_WIN64) && !defined(__CYGWIN__)
 DWORD WINAPI thread_process_vanity(LPVOID vargp);
@@ -341,6 +346,10 @@ Int subtractStride;
 int FLAGSUBTRACTKEY = 0;
 struct bloom bloom_subtract;
 bool bloom_subtract_initialized = false;
+
+int FLAGOPTIMIZEDPRIME = 0;  // Flag for optimized prime mode
+uint64_t current_prime = 2;   // Start with first prime
+uint64_t steps_taken = 0;     // Count steps taken with current prime
 
 int FLAGSKIPCHECKSUM = 0;
 int FLAGENDOMORPHISM = 0;
@@ -552,10 +561,14 @@ int main(int argc, char **argv)
 
     printf("[+] Version %s, developed by AlbertoBSD\n", version);
 
-    while ((c = getopt(argc, argv, "deh6MqRSB:b:c:C:E:f:I:k:L:l:m:N:n:p:P:r:s:t:v:V:G:8:z:")) != -1)
+    while ((c = getopt(argc, argv, "deh6MoqRSB:b:c:C:E:f:I:k:L:l:m:N:n:p:P:r:s:t:v:V:G:8:z:")) != -1)
     {
         switch (c)
         {
+            case 'o':
+    FLAGOPTIMIZEDPRIME = 1;
+    printf("[+] Using optimized prime step mode\n");
+    break;
             case 'P': {
                 // Handle comma-separated list of target public keys
                 std::string pubkeys_input = optarg;
@@ -1160,6 +1173,11 @@ case MODE_SUBTRACT:
             writeFileIfNeeded(fileName);
         }
     }
+    // Add this after processing all options
+if (FLAGOPTIMIZEDPRIME && FLAGSTRIDE && !stride.IsOne()) {
+    fprintf(stderr, "[E] Cannot use both -o (optimized prime) and -V (fixed stride) together\n");
+    exit(EXIT_FAILURE);
+}
 
     if (FLAGMODE == MODE_SUBTRACT) {
         if (FLAGSUBTRACTKEY == 0) {
@@ -3287,9 +3305,15 @@ void *thread_process_subtract(void *vargp)
     
     int r, thread_number, continue_flag = 1;
     size_t k;
-    bool match_found;
+    bool match_found = false;
     
     Int key_mpz, subtractValue, keyfound;
+    
+    // Thread-specific stride calculation
+    Int thread_specific_stride;
+    
+    // For optimized prime mode
+    Int current_prime_int;
     
     tt = (struct tothread *)vargp;
     thread_number = tt->nt;
@@ -3297,143 +3321,197 @@ void *thread_process_subtract(void *vargp)
     
     grp->Set(dx);
     
-    do {
-        if (FLAGRANDOM) {
-            key_mpz.Rand(&n_range_start, &n_range_end);
-        } else {
-            if (n_range_start.IsLower(&n_range_end)) {
-#if defined(_WIN64) && !defined(__CYGWIN__)
-                WaitForSingleObject(write_random, INFINITE);
-                key_mpz.Set(&n_range_start);
-                n_range_start.Add(&subtractStride);
-                ReleaseMutex(write_random);
-#else
-                pthread_mutex_lock(&write_random);
-                key_mpz.Set(&n_range_start);
-                n_range_start.Add(&subtractStride);
-                pthread_mutex_unlock(&write_random);
-#endif
-            } else {
-                continue_flag = 0;
+    // Each thread starts at a different offset within the range
+    Int thread_start_range;
+    thread_start_range.Set(&n_range_start);
+    
+    // Calculate thread-specific stride
+    if (FLAGOPTIMIZEDPRIME) {
+        current_prime_int.SetInt64(current_prime);
+        // Calculate stride based on range and prime
+        calculate_prime_stride(n_range_diff, current_prime_int, thread_specific_stride);
+        
+        if (FLAGDEBUG) {
+            char *prime_str = current_prime_int.GetBase10();
+            char *stride_str = thread_specific_stride.GetBase10();
+            printf("[D] Thread %d using prime %s with stride %s\n", 
+                   thread_number, prime_str, stride_str);
+            free(prime_str);
+            free(stride_str);
+        }
+    } else {
+        thread_specific_stride.Set(&subtractStride);
+        thread_specific_stride.Mult(NTHREADS);
+    }
+    
+    // Adjust starting point based on thread number
+    if (thread_number > 0) {
+        Int thread_offset;
+        thread_offset.Set(&subtractStride);
+        thread_offset.Mult(thread_number);
+        thread_start_range.Add(&thread_offset);
+        
+        // Check if adjusted start is beyond our end range
+        if (thread_start_range.IsGreater(&n_range_end)) {
+            thread_start_range.Set(&n_range_start); // Reset to start range
+            
+            if (FLAGDEBUG) {
+                printf("[D] Thread %d starting value exceeds range, reset to start\n", thread_number);
             }
         }
+    }
+    
+    // Set our current key to our thread's starting position
+    key_mpz.Set(&thread_start_range);
+    
+    // For debugging, output the thread's starting position
+    if (FLAGDEBUG) {
+        char *hextemp = key_mpz.GetBase16();
+        printf("[D] Thread %d starting at: 0x%s with stride: %s\n", 
+               thread_number, hextemp, thread_specific_stride.GetBase10());
+        free(hextemp);
+    }
+    
+    // Track whether all keys have been found
+    bool all_keys_found = false;
+    
+    // Main processing loop
+    do {
+        // Store our current subtract value
+        subtractValue.Set(&key_mpz);
         
-        if (continue_flag) {
-            // Get current subtract value
-            subtractValue.Set(&key_mpz);
+        // Display current progress
+        if (!FLAGQUIET) {
+            char *hextemp = subtractValue.GetBase16();
+            if (FLAGOPTIMIZEDPRIME) {
+                // Calculate the result of target - subtractValue for display
+                // We'll use the first target key for the display
+                Point displayPubKey;
+                if (targetSubtractKeys.size() > 0) {
+                    // Get the negated subtract key 
+                    Point subPubKey = secp->ComputePublicKey(&subtractValue);
+                    Point negSubPubKey = secp->Negation(subPubKey);
+                    
+                    // Add to the target key to get the result
+                    displayPubKey = secp->AddDirect(targetSubtractKeys[0], negSubPubKey);
+                } else {
+                    // Fallback if no target keys (shouldn't happen)
+                    displayPubKey = secp->ComputePublicKey(&subtractValue);
+                }
+                
+                char *pubKeyHex = secp->GetPublicKeyHex(true, displayPubKey); // Get compressed public key
+                char *strideHex = thread_specific_stride.GetBase16();
+                
+                printf("\rSubVal:0x%s Pubkey: %s Step Value: 0x%s Prime Step: %llu     ", 
+                       hextemp, pubKeyHex, strideHex, current_prime);
+                
+                free(pubKeyHex);
+                free(strideHex);
+            } else {
+                printf("\r[+] Thread %d subtracting 0x%s     ", thread_number, hextemp);
+            }
+            fflush(stdout);
+            free(hextemp);
+            THREADOUTPUT = 1;
+        }
+        
+        // Check if we've exceeded the range - but only exit if we're NOT in optimized prime mode
+        // In optimized prime mode, we'll keep going and adjust our strategy
+        if (subtractValue.IsGreater(&n_range_end) && !FLAGOPTIMIZEDPRIME) {
+            if (FLAGDEBUG) {
+                printf("[D] Thread %d exceeded range, stopping\n", thread_number);
+            }
+            continue_flag = 0;
+            break;
+        }
             
-            // Display for debugging
-            if (!FLAGQUIET) {
-                char *hextemp = subtractValue.GetBase16();
-                printf("\r[+] Subtracting 0x%s     \r", hextemp);
-                fflush(stdout);
-                free(hextemp);
-                THREADOUTPUT = 1;
+        // Compute the corresponding public key for subtractValue
+        Point subtractPubKey = secp->ComputePublicKey(&subtractValue);
+        
+        // Negate the public key (for subtraction)
+        Point negatedSubtractPubKey = secp->Negation(subtractPubKey);
+        
+        // Process each target public key
+        for (k = 0; k < targetSubtractKeys.size(); k++) {
+            if (subtractKeyFound[k]) {
+                continue;
             }
             
-            // Compute the corresponding public key for subtractValue
-            Point subtractPubKey = secp->ComputePublicKey(&subtractValue);
+            // Calculate result of target - subtractValue (as points on the curve)
+            // This is equivalent to target + (-subtractValue)
+            Point resultPoint = secp->AddDirect(targetSubtractKeys[k], negatedSubtractPubKey);
             
-            // Negate the public key (for subtraction)
-            Point negatedSubtractPubKey = secp->Negation(subtractPubKey);
+            // Get the X coordinate bytes for bloom filter check
+            resultPoint.x.Get32Bytes(xpoint_raw);
             
-            // Process each batch of CPU_GRP_SIZE points for higher efficiency
-            // Loop through all target public keys
-            for (k = 0; k < targetSubtractKeys.size(); k++) {
-                if (subtractKeyFound[k]) {
-                    continue;
-                }
+            // Check if X coordinate exists in our bloom filter
+            r = bloom_check(&bloom_subtract, xpoint_raw, 32);
+            
+            if (r) {
+                // If found, verify the result and report
+                printf("\n[+] Thread %d found possible matching public key using subtract value!\n", thread_number);
+                write_subtract_key(subtractValue, k);
+                subtractKeyFound[k] = true;
+                match_found = true;
                 
-                // Calculate result of target - subtractValue (as points on the curve)
-                // This is equivalent to target + (-subtractValue)
-                Point resultPoint = secp->AddDirect(targetSubtractKeys[k], negatedSubtractPubKey);
-                
-                // Get the X coordinate bytes for bloom filter check
-                resultPoint.x.Get32Bytes(xpoint_raw);
-                
-                // Check if X coordinate exists in our bloom filter
-                r = bloom_check(&bloom_subtract, xpoint_raw, 32);
-                
-                if (r) {
-                    // If found, verify the result and report
-                    printf("\n[MATCH] Found possible matching public key using subtract value!\n");
-                    write_subtract_key(subtractValue, k);
-                    subtractKeyFound[k] = true;
-                    
-                    // Check if all keys have been found
-                    bool all_found = true;
-                    for (size_t j = 0; j < subtractKeyFound.size(); j++) {
-                        if (!subtractKeyFound[j]) {
-                            all_found = false;
-                            break;
-                        }
-                    }
-                    
-                    if (all_found) {
-                        printf("[+] All target keys have been found!\n");
-                        delete grp;
-                        ends[thread_number] = 1;
-                        return NULL;
+                // Check if all keys have been found
+                all_keys_found = true;
+                for (size_t j = 0; j < subtractKeyFound.size(); j++) {
+                    if (!subtractKeyFound[j]) {
+                        all_keys_found = false;
+                        break;
                     }
                 }
                 
-                // Now we'll process a batch of points around the current subtract value for efficiency
-                if (!subtractKeyFound[k]) {
-                    // Starting point: Compute target + (-subtractBase) where subtractBase is key_mpz adjusted by CPU_GRP_SIZE/2
-                    Int adjustedSubtract(subtractValue);
-                    adjustedSubtract.Add(CPU_GRP_SIZE / 2);
-                    Point adjustedSubtractPubKey = secp->ComputePublicKey(&adjustedSubtract);
-                    Point negatedAdjustedPubKey = secp->Negation(adjustedSubtractPubKey);
-                    
-                    // This is our starting point for the batch
-                    startP = secp->AddDirect(targetSubtractKeys[k], negatedAdjustedPubKey);
-                    
-                    // Using the group operations similar to the original BSGS implementation
-                    for (i = 0; i < hLength; i++) {
-                        dx[i].ModSub(&Gn[i].x, &startP.x);
-                    }
+                if (all_keys_found) {
+                    printf("[+] All target keys have been found!\n");
+                    delete grp;
+                    ends[thread_number] = 1;
+                    return NULL;
+                }
+            }
+            
+            // Now check a batch of points around the current key
+            if (!subtractKeyFound[k]) {
+                // Starting point: Compute target + (-subtractBase) where subtractBase is key_mpz adjusted by CPU_GRP_SIZE/2
+                Int adjustedSubtract(subtractValue);
+                adjustedSubtract.Add(CPU_GRP_SIZE / 2);
+                Point adjustedSubtractPubKey = secp->ComputePublicKey(&adjustedSubtract);
+                Point negatedAdjustedPubKey = secp->Negation(adjustedSubtractPubKey);
+                
+                // This is our starting point for the batch
+                startP = secp->AddDirect(targetSubtractKeys[k], negatedAdjustedPubKey);
+                
+                // Using the group operations for efficiency
+                for (i = 0; i < hLength; i++) {
                     dx[i].ModSub(&Gn[i].x, &startP.x);
-                    dx[i + 1].ModSub(&_2Gn.x, &startP.x);
+                }
+                dx[i].ModSub(&Gn[i].x, &startP.x);
+                dx[i + 1].ModSub(&_2Gn.x, &startP.x);
+                
+                // Group inversion
+                grp->ModInv();
+                
+                // Center point
+                pts[CPU_GRP_SIZE / 2] = startP;
+                
+                // Calculate points in both directions from the center
+                for (i = 0; i < hLength; i++) {
+                    // Point in positive direction
+                    pp = startP;
                     
-                    // Group inversion
-                    grp->ModInv();
-                    
-                    // Center point
-                    pts[CPU_GRP_SIZE / 2] = startP;
-                    
-                    // Calculate points in both directions from the center
-                    for (i = 0; i < hLength; i++) {
-                        // Point in positive direction
-                        pp = startP;
-                        
-                        // Point in negative direction
-                        pn = startP;
-                        
-                        // P = startP + i*G
-                        dy.ModSub(&Gn[i].y, &pp.y);
-                        _s.ModMulK1(&dy, &dx[i]);
-                        _p.ModSquareK1(&_s);
-                        pp.x.ModNeg();
-                        pp.x.ModAdd(&_p);
-                        pp.x.ModSub(&Gn[i].x);
-                        
-                        // P = startP - i*G
-                        dyn.Set(&Gn[i].y);
-                        dyn.ModNeg();
-                        dyn.ModSub(&pn.y);
-                        _s.ModMulK1(&dyn, &dx[i]);
-                        _p.ModSquareK1(&_s);
-                        pn.x.ModNeg();
-                        pn.x.ModAdd(&_p);
-                        pn.x.ModSub(&Gn[i].x);
-                        
-                        // Store points in array
-                        pts[CPU_GRP_SIZE / 2 + (i + 1)] = pp;
-                        pts[CPU_GRP_SIZE / 2 - (i + 1)] = pn;
-                    }
-                    
-                    // First point (startP - (GRP_SIZE/2)*G)
+                    // Point in negative direction
                     pn = startP;
+                    
+                    // P = startP + i*G
+                    dy.ModSub(&Gn[i].y, &pp.y);
+                    _s.ModMulK1(&dy, &dx[i]);
+                    _p.ModSquareK1(&_s);
+                    pp.x.ModNeg();
+                    pp.x.ModAdd(&_p);
+                    pp.x.ModSub(&Gn[i].x);
+                    
+                    // P = startP - i*G
                     dyn.Set(&Gn[i].y);
                     dyn.ModNeg();
                     dyn.ModSub(&pn.y);
@@ -3442,54 +3520,132 @@ void *thread_process_subtract(void *vargp)
                     pn.x.ModNeg();
                     pn.x.ModAdd(&_p);
                     pn.x.ModSub(&Gn[i].x);
-                    pts[0] = pn;
                     
-                    // Check all points in the batch
-                    for (int j = 0; j < CPU_GRP_SIZE && !subtractKeyFound[k]; j++) {
-                        // Get X coordinate bytes
-                        pts[j].x.Get32Bytes(xpoint_raw);
+                    // Store points in array
+                    pts[CPU_GRP_SIZE / 2 + (i + 1)] = pp;
+                    pts[CPU_GRP_SIZE / 2 - (i + 1)] = pn;
+                }
+                
+                // First point (startP - (GRP_SIZE/2)*G)
+                pn = startP;
+                dyn.Set(&Gn[i].y);
+                dyn.ModNeg();
+                dyn.ModSub(&pn.y);
+                _s.ModMulK1(&dyn, &dx[i]);
+                _p.ModSquareK1(&_s);
+                pn.x.ModNeg();
+                pn.x.ModAdd(&_p);
+                pn.x.ModSub(&Gn[i].x);
+                pts[0] = pn;
+                
+                // Check all points in the batch
+                for (int j = 0; j < CPU_GRP_SIZE && !subtractKeyFound[k]; j++) {
+                    // Get X coordinate bytes
+                    pts[j].x.Get32Bytes(xpoint_raw);
+                    
+                    // Check against bloom filter
+                    r = bloom_check(&bloom_subtract, xpoint_raw, 32);
+                    
+                    if (r) {
+                        // Calculate the actual subtract value
+                        Int actualSubtractVal(subtractValue);
+                        actualSubtractVal.Sub(CPU_GRP_SIZE / 2);
+                        actualSubtractVal.Add(j);
                         
-                        // Check against bloom filter
-                        r = bloom_check(&bloom_subtract, xpoint_raw, 32);
+                        printf("\n[+] Thread %d found possible matching public key using subtract value!\n", thread_number);
+                        write_subtract_key(actualSubtractVal, k);
+                        subtractKeyFound[k] = true;
+                        match_found = true;
                         
-                        if (r) {
-                            // Calculate the actual subtract value
-                            Int actualSubtractVal(subtractValue);
-                            actualSubtractVal.Sub(CPU_GRP_SIZE / 2);
-                            actualSubtractVal.Add(j);
-                            
-                            printf("\n[MATCH] Found possible matching public key using subtract value!\n");
-                            write_subtract_key(actualSubtractVal, k);
-                            subtractKeyFound[k] = true;
-                            
-                            // Check if all keys have been found
-                            bool all_found = true;
-                            for (size_t j = 0; j < subtractKeyFound.size(); j++) {
-                                if (!subtractKeyFound[j]) {
-                                    all_found = false;
-                                    break;
-                                }
+                        // Check if all keys have been found
+                        all_keys_found = true;
+                        for (size_t j = 0; j < subtractKeyFound.size(); j++) {
+                            if (!subtractKeyFound[j]) {
+                                all_keys_found = false;
+                                break;
                             }
-                            
-                            if (all_found) {
-                                printf("[+] All target keys have been found!\n");
-                                delete grp;
-                                ends[thread_number] = 1;
-                                return NULL;
-                            }
+                        }
+                        
+                        if (all_keys_found) {
+                            printf("[+] All target keys have been found!\n");
+                            delete grp;
+                            ends[thread_number] = 1;
+                            return NULL;
                         }
                     }
                 }
             }
-            
-            steps[thread_number]++;
         }
+        
+        // Increment for next iteration
+        if (FLAGOPTIMIZEDPRIME) {
+            steps_taken++;
+            
+            #if defined(_WIN64) && !defined(__CYGWIN__)
+            WaitForSingleObject(bsgs_thread, INFINITE);
+            #else
+            pthread_mutex_lock(&bsgs_thread);
+            #endif
+            
+            if (steps_taken >= current_prime) {
+                // Time to move to next prime
+                current_prime = next_prime(current_prime);
+                steps_taken = 0;
+                current_prime_int.SetInt64(current_prime);
+                
+                // Recalculate stride
+                calculate_prime_stride(n_range_diff, current_prime_int, thread_specific_stride);
+                
+                // For optimized prime mode, reset key_mpz back to start range periodically
+                // This prevents us from going too far outside the range
+                if (thread_number == 0) {
+                    key_mpz.Set(&n_range_start);
+                } else {
+                    // Keep threads separated
+                    key_mpz.Set(&n_range_start);
+                    Int thread_offset;
+                    thread_offset.Set(&subtractStride);
+                    thread_offset.Mult(thread_number);
+                    key_mpz.Add(&thread_offset);
+                }
+                
+                if (!FLAGQUIET) {
+                    char *stride_str = thread_specific_stride.GetBase10();
+                    printf("\r[+] Moving to prime: %llu with stride: %s  \r", 
+                           current_prime, stride_str);
+                    free(stride_str);
+                    fflush(stdout);
+                }
+            } else {
+                // Regular increment using the calculated stride
+                key_mpz.Add(&thread_specific_stride);
+            }
+            
+            #if defined(_WIN64) && !defined(__CYGWIN__)
+            ReleaseMutex(bsgs_thread);
+            #else
+            pthread_mutex_unlock(&bsgs_thread);
+            #endif
+        } else {
+            // Increment by NTHREADS*stride for next iteration, so each thread covers a unique range
+            key_mpz.Add(&thread_specific_stride);
+            
+            // If we've reached the end of our range and not in optimized prime mode, we're done
+            if (key_mpz.IsGreater(&n_range_end)) {
+                continue_flag = 0;
+            }
+        }
+        
+        steps[thread_number]++;
+        
     } while (continue_flag);
     
     ends[thread_number] = 1;
     delete grp;
     return NULL;
 }
+
+
 
 #if defined(_WIN64) && !defined(__CYGWIN__)
 DWORD WINAPI thread_process(LPVOID vargp)
@@ -8385,7 +8541,7 @@ bool init_subtract_bloom_filter(const char *filename) {
     printf("[+] Estimated entries: %lu\n", total_entries);
     
     // Calculate bloom filter size with low false positive rate
-    double fp_rate = 0.000001; // One in a million false positive rate
+    double fp_rate = 0.000000000001; // One in a million false positive rate
     
     // Initialize bloom filter - use a larger size factor for better performance
     if (bloom_init2(&bloom_subtract, total_entries * FLAGBLOOMMULTIPLIER, fp_rate) != 0) {
@@ -8669,7 +8825,13 @@ void write_subtract_key(Int &subtractValue, size_t keyIndex) {
         fprintf(filekey, "Subtract public key: %s\n", subtractPubKeyHex);
         fprintf(filekey, "Negated subtract key: %s\n", negatedPubKeyHex);
         fprintf(filekey, "Result (Target - Subtract): %s\n", resultPointHex);
-        fprintf(filekey, "Private key calculation: (Database private key) = (Target private key) - %s\n\n", subtractHex);
+        fprintf(filekey, "Private key calculation: (Database private key) = (Target private key) - %s\n", subtractHex);
+        
+        if (FLAGOPTIMIZEDPRIME) {
+            fprintf(filekey, "Prime step: %llu, Steps taken: %llu\n", current_prime, steps_taken);
+        }
+        
+        fprintf(filekey, "\n");
         fclose(filekey);
     }
     
@@ -8681,6 +8843,10 @@ void write_subtract_key(Int &subtractValue, size_t keyIndex) {
     printf("Result (Target - Subtract): %s\n", resultPointHex);
     printf("Private key calculation: (Database private key) = (Target private key) - %s\n", subtractHex);
     
+    if (FLAGOPTIMIZEDPRIME) {
+        printf("Prime step: %llu, Steps taken: %llu\n", current_prime, steps_taken);
+    }
+    
 #if defined(_WIN64) && !defined(__CYGWIN__)
     ReleaseMutex(write_keys);
 #else
@@ -8691,6 +8857,84 @@ void write_subtract_key(Int &subtractValue, size_t keyIndex) {
     free(subtractPubKeyHex);
     free(negatedPubKeyHex);
     free(resultPointHex);
+}
+
+bool is_prime(uint64_t n) {
+    if (n <= 1) return false;
+    if (n <= 3) return true;
+    if (n % 2 == 0 || n % 3 == 0) return false;
+    
+    for (uint64_t i = 5; i * i <= n; i += 6) {
+        if (n % i == 0 || n % (i + 2) == 0)
+            return false;
+    }
+    return true;
+}
+
+
+
+void calculate_prime_stride(Int &range_diff, Int &current_prime_int, Int &stride) {
+    // We want to find a stride value such that:
+    // stride * prime_number = range_size (approximately)
+    Int range_size;
+    range_size.Set(&range_diff);
+    
+    Int prime_copy;
+    prime_copy.Set(&current_prime_int);
+    
+    // Divide the range by the prime number to get our stride
+    stride.Set(&range_size);
+    stride.Div(&prime_copy);
+    
+    // Ensure we don't get stride = 0
+    if (stride.IsZero()) {
+        stride.SetInt32(1);
+    }
+    
+    // Debug output if needed
+    if (FLAGDEBUG) {
+        char *range_str = range_size.GetBase10();
+        char *prime_str = prime_copy.GetBase10();
+        char *stride_str = stride.GetBase10();
+        
+        printf("[D] Range size: %s, Prime: %s, Calculated stride: %s\n",
+               range_str, prime_str, stride_str);
+        
+        free(range_str);
+        free(prime_str);
+        free(stride_str);
+    }
+}
+
+// Fix the prime number generation
+uint64_t next_prime(uint64_t n) {
+    if (n <= 1) return 2;
+    
+    uint64_t prime = n;
+    bool found = false;
+    
+    // Simple implementation for finding the next prime
+    while (!found) {
+        prime++;
+        
+        // Check if prime
+        bool is_prime = true;
+        if (prime <= 1) is_prime = false;
+        else if (prime <= 3) is_prime = true;
+        else if (prime % 2 == 0 || prime % 3 == 0) is_prime = false;
+        else {
+            for (uint64_t i = 5; i * i <= prime; i += 6) {
+                if (prime % i == 0 || prime % (i + 2) == 0) {
+                    is_prime = false;
+                    break;
+                }
+            }
+        }
+        
+        if (is_prime) found = true;
+    }
+    
+    return prime;
 }
 
 
