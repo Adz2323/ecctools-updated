@@ -244,6 +244,7 @@ uint64_t estimate_subtract_bloom_size(uint64_t items, double fp_rate);
 void calculate_prime_stride(Int &range_diff, Int &current_prime_int, Int &stride);
 uint64_t next_prime(uint64_t n);
 bool is_prime(uint64_t n);
+bool verify_pubkey_in_file(Point &resultPoint);
 
 
 
@@ -350,6 +351,9 @@ bool bloom_subtract_initialized = false;
 int FLAGOPTIMIZEDPRIME = 0;  // Flag for optimized prime mode
 uint64_t current_prime = 2;   // Start with first prime
 uint64_t steps_taken = 0;     // Count steps taken with current prime
+uint64_t starting_prime = 2;
+uint64_t global_steps_taken = 0;  // Global step counter for optimized prime mode
+Int global_base_key;              // Base key for the current prime cycle
 
 int FLAGSKIPCHECKSUM = 0;
 int FLAGENDOMORPHISM = 0;
@@ -364,6 +368,7 @@ int FLAGMATRIX = 0;
 int KFACTOR = 1;
 int MAXLENGTHADDRESS = -1;
 int NTHREADS = 1;
+int FLAGRANDOMMULTIPLE = 0;
 
 int FLAGSAVEREADFILE = 0;
 int FLAGREADEDFILE1 = 0;
@@ -561,10 +566,21 @@ int main(int argc, char **argv)
 
     printf("[+] Version %s, developed by AlbertoBSD\n", version);
 
-    while ((c = getopt(argc, argv, "deh6MoqRSB:b:c:C:E:f:I:k:L:l:m:N:n:p:P:r:s:t:v:V:G:8:z:")) != -1)
+    while ((c = getopt(argc, argv, "deh6MoqRSB:b:c:C:E:f:I:k:L:l:m:N:n:p:P:r:s:t:v:V:G:8:z:O:X")) != -1)
+{
+    switch (c)
     {
-        switch (c)
-        {
+        case 'X':  // Use 'X' for random multiple mode
+            FLAGRANDOMMULTIPLE = 1;
+            printf("[+] Random Multiple mode enabled\n");
+            break;
+            case 'O':
+    starting_prime = strtoull(optarg, NULL, 10);
+    if (starting_prime < 2) {
+        starting_prime = 2;
+    }
+    printf("[+] Starting with prime: %llu\n", starting_prime);
+    break;
             case 'o':
     FLAGOPTIMIZEDPRIME = 1;
     printf("[+] Using optimized prime step mode\n");
@@ -1179,6 +1195,8 @@ if (FLAGOPTIMIZEDPRIME && FLAGSTRIDE && !stride.IsOne()) {
     exit(EXIT_FAILURE);
 }
 
+current_prime = starting_prime;
+
     if (FLAGMODE == MODE_SUBTRACT) {
         if (FLAGSUBTRACTKEY == 0) {
             fprintf(stderr, "[E] Subtract mode requires target public key(s). Use -P option.\n");
@@ -1200,6 +1218,51 @@ if (FLAGOPTIMIZEDPRIME && FLAGSTRIDE && !stride.IsOne()) {
             exit(EXIT_FAILURE);
         }
     }
+
+    if (FLAGRANDOMMULTIPLE && !FLAGMODE == MODE_SUBTRACT) {
+    fprintf(stderr, "[W] Random Multiple mode is only supported for subtract mode. Ignoring flag.\n");
+    FLAGRANDOMMULTIPLE = 0;
+}
+
+if (FLAGRANDOMMULTIPLE && FLAGOPTIMIZEDPRIME) {
+    fprintf(stderr, "[W] Random Multiple mode cannot be used with optimized prime mode. Using Random Multiple only.\n");
+    FLAGOPTIMIZEDPRIME = 0;
+}
+
+// In the main function:
+if (FLAGMODE == MODE_SUBTRACT && FLAGRANDOMMULTIPLE) {
+    // Calculate and display the random multiple information using GLOBAL range
+    Int total_range;
+    Int max_steps;
+    
+    // Calculate total range - from n_range_start to n_range_end
+    total_range.Set(&n_range_end);
+    total_range.Sub(&n_range_start);
+    
+    // Calculate how many steps it takes to traverse the range
+    max_steps.Set(&total_range);
+    max_steps.Div(&subtractStride);
+    
+    // Print this information to console
+    char *range_str = total_range.GetBase10();
+    char *step_str = subtractStride.GetBase10();
+    char *max_steps_str = max_steps.GetBase10();
+    char *start_hex = n_range_start.GetBase16();
+    char *end_hex = n_range_end.GetBase16();
+    
+    printf("\n[+] Random Multiple Mode Information:\n");
+    printf("    Full range: 0x%s to 0x%s\n", start_hex, end_hex);
+    printf("    Total range size: %s\n", range_str);
+    printf("    Step value: %s (0x%s)\n", step_str, subtractStride.GetBase16());
+    printf("    Maximum steps to complete range: %s\n", max_steps_str);
+    printf("    Random selection will span the entire range\n\n");
+    
+    free(range_str);
+    free(step_str);
+    free(max_steps_str);
+    free(start_hex);
+    free(end_hex);
+}
 
     if (FLAGMODE == MODE_BSGS)
     {
@@ -2781,6 +2844,36 @@ case MODE_SUBTRACT:
     return 0;
 }
 
+bool verify_pubkey_in_file(Point &resultPoint) {
+    // Use hardcoded filename - simple and reliable
+    const char* hardcoded_filename = "134.bin";
+    
+    FILE *file = fopen(hardcoded_filename, "rb");
+    if (file == NULL) {
+        printf("[W] Cannot open verification file %s - accepting hit without verification\n", hardcoded_filename);
+        return true; // Accept the hit if file can't be opened
+    }
+    
+    // Get the X coordinate of the result point
+    unsigned char result_x[32];
+    resultPoint.x.Get32Bytes(result_x);
+    
+    // Since we know it's a binary file (134.bin), we can assume the format
+    // Read each compressed public key (33 bytes) and check for a match
+    unsigned char pubkey_buffer[33];
+    
+    while (fread(pubkey_buffer, 33, 1, file) == 1) {
+        // Compare X coordinate (skip the first byte which is the compression flag)
+        if (memcmp(result_x, pubkey_buffer + 1, 32) == 0) {
+            fclose(file);
+            return true;  // Found a match
+        }
+    }
+    
+    fclose(file);
+    printf("[I] False positive: Point not found in verification file\n");
+    return false;  // No match found
+}
 void init_pubkey_buffers()
 {
     thread_buffers = (PubkeyBuffer *)calloc(NUM_BUFFERS, sizeof(PubkeyBuffer));
@@ -3309,11 +3402,16 @@ void *thread_process_subtract(void *vargp)
     
     Int key_mpz, subtractValue, keyfound;
     
-    // Thread-specific stride calculation
-    Int thread_specific_stride;
+    // For range splitting approach
+    Int thread_start_range, thread_end_range;
     
     // For optimized prime mode
     Int current_prime_int;
+    
+    // For random multiple mode - use GLOBAL range, not thread range
+    Int max_steps_global;
+    Int random_step;
+    Int temp_step;
     
     tt = (struct tothread *)vargp;
     thread_number = tt->nt;
@@ -3321,15 +3419,60 @@ void *thread_process_subtract(void *vargp)
     
     grp->Set(dx);
     
-    // Each thread starts at a different offset within the range
-    Int thread_start_range;
-    thread_start_range.Set(&n_range_start);
+    // Calculate range size for each thread - proper Int division
+    Int range_size;
+    range_size.Set(&n_range_diff);
     
-    // Calculate thread-specific stride
+    Int nThreads;
+    nThreads.SetInt32(NTHREADS);
+    
+    Int section_size;
+    section_size.Set(&range_size);
+    section_size.Div(&nThreads);  // Fixed: Using Int division with Int object
+    
+    // Calculate start range for this thread
+    thread_start_range.Set(&n_range_start);
+    Int thread_offset;
+    thread_offset.Set(&section_size);
+    
+    Int threadNum;
+    threadNum.SetInt32(thread_number);
+    thread_offset.Mult(&threadNum);
+    
+    thread_start_range.Add(&thread_offset);
+    
+    // Calculate end range for this thread
+    thread_end_range.Set(&thread_start_range);
+    thread_end_range.Add(&section_size);
+    
+    // Make sure we don't exceed the global end range
+    if (thread_end_range.IsGreater(&n_range_end)) {
+        thread_end_range.Set(&n_range_end);
+    }
+    
+    if (FLAGDEBUG) {
+        char *start_hex = thread_start_range.GetBase16();
+        char *end_hex = thread_end_range.GetBase16();
+        printf("[D] Thread %d range: 0x%s to 0x%s\n", thread_number, start_hex, end_hex);
+        free(start_hex);
+        free(end_hex);
+    }
+
+    // Set thread-specific stride
+    Int thread_specific_stride;
+    
     if (FLAGOPTIMIZEDPRIME) {
+        // Different starting points for different threads in prime mode
+        // Each thread uses a different prime in the sequence
+        uint64_t thread_prime = starting_prime;
+        for (int i = 0; i < thread_number; i++) {
+            thread_prime = next_prime(thread_prime);
+        }
+        current_prime = thread_prime;
         current_prime_int.SetInt64(current_prime);
-        // Calculate stride based on range and prime
-        calculate_prime_stride(n_range_diff, current_prime_int, thread_specific_stride);
+        
+        // Calculate initial stride based on range and prime
+        calculate_prime_stride(range_size, current_prime_int, thread_specific_stride);
         
         if (FLAGDEBUG) {
             char *prime_str = current_prime_int.GetBase10();
@@ -3341,27 +3484,16 @@ void *thread_process_subtract(void *vargp)
         }
     } else {
         thread_specific_stride.Set(&subtractStride);
-        thread_specific_stride.Mult(NTHREADS);
     }
     
-    // Adjust starting point based on thread number
-    if (thread_number > 0) {
-        Int thread_offset;
-        thread_offset.Set(&subtractStride);
-        thread_offset.Mult(thread_number);
-        thread_start_range.Add(&thread_offset);
-        
-        // Check if adjusted start is beyond our end range
-        if (thread_start_range.IsGreater(&n_range_end)) {
-            thread_start_range.Set(&n_range_start); // Reset to start range
-            
-            if (FLAGDEBUG) {
-                printf("[D] Thread %d starting value exceeds range, reset to start\n", thread_number);
-            }
-        }
+    // For RANDOM MULTIPLE mode: Use the GLOBAL range, not thread range
+    if (FLAGRANDOMMULTIPLE) {
+        // Calculate how many steps it takes to traverse the GLOBAL range
+        max_steps_global.Set(&n_range_diff);
+        max_steps_global.Div(&thread_specific_stride);
     }
     
-    // Set our current key to our thread's starting position
+    // Set key to thread's starting position  
     key_mpz.Set(&thread_start_range);
     
     // For debugging, output the thread's starting position
@@ -3372,54 +3504,87 @@ void *thread_process_subtract(void *vargp)
         free(hextemp);
     }
     
-    // Track whether all keys have been found
-    bool all_keys_found = false;
-    
     // Main processing loop
     do {
+        // For random multiple mode, generate a random value across the ENTIRE range
+        if (FLAGRANDOMMULTIPLE) {
+            #if defined(_WIN64) && !defined(__CYGWIN__)
+            WaitForSingleObject(bsgs_thread, INFINITE);
+            #else
+            pthread_mutex_lock(&bsgs_thread);
+            #endif
+            
+            // Generate a truly random number within the global range
+            random_step.Rand(256);  // Generate a random 256-bit number
+            random_step.Mod(&max_steps_global);  // Reduce it to our range
+            
+            // Calculate the actual key: min_range + (step_value * random_multiple)
+            temp_step.Set(&thread_specific_stride);
+            temp_step.Mult(&random_step);
+            
+            key_mpz.Set(&n_range_start);
+            key_mpz.Add(&temp_step);
+            
+            // Make sure we don't exceed the end range
+            if (key_mpz.IsGreater(&n_range_end)) {
+                // If we exceed, try again
+                random_step.Rand(256);
+                random_step.Mod(&max_steps_global);
+                temp_step.Set(&thread_specific_stride);
+                temp_step.Mult(&random_step);
+                key_mpz.Set(&n_range_start);
+                key_mpz.Add(&temp_step);
+            }
+            
+            #if defined(_WIN64) && !defined(__CYGWIN__)
+            ReleaseMutex(bsgs_thread);
+            #else
+            pthread_mutex_unlock(&bsgs_thread);
+            #endif
+        }
+        
         // Store our current subtract value
         subtractValue.Set(&key_mpz);
         
         // Display current progress
         if (!FLAGQUIET) {
             char *hextemp = subtractValue.GetBase16();
+            
+            // Compute the public key for subtract value
+            Point subPubKey = secp->ComputePublicKey(&subtractValue);
+            
+            // Negate the public key (for subtraction)
+            Point negatedSubtractPubKey = secp->Negation(subPubKey);
+            
+            // Calculate the result of target - subtractValue (what we're actually checking)
+            Point resultPoint = secp->AddDirect(targetSubtractKeys[0], negatedSubtractPubKey);
+            
+            // Get the display strings for both keys
+            char *subPubKeyHex = secp->GetPublicKeyHex(true, subPubKey);
+            char *resultPubKeyHex = secp->GetPublicKeyHex(true, resultPoint);
+            
             if (FLAGOPTIMIZEDPRIME) {
-                // Calculate the result of target - subtractValue for display
-                // We'll use the first target key for the display
-                Point displayPubKey;
-                if (targetSubtractKeys.size() > 0) {
-                    // Get the negated subtract key 
-                    Point subPubKey = secp->ComputePublicKey(&subtractValue);
-                    Point negSubPubKey = secp->Negation(subPubKey);
-                    
-                    // Add to the target key to get the result
-                    displayPubKey = secp->AddDirect(targetSubtractKeys[0], negSubPubKey);
-                } else {
-                    // Fallback if no target keys (shouldn't happen)
-                    displayPubKey = secp->ComputePublicKey(&subtractValue);
-                }
-                
-                char *pubKeyHex = secp->GetPublicKeyHex(true, displayPubKey); // Get compressed public key
-                char *strideHex = thread_specific_stride.GetBase16();
-                
-                printf("\rSubVal:0x%s Pubkey: %s Step Value: 0x%s Prime Step: %llu     ", 
-                       hextemp, pubKeyHex, strideHex, current_prime);
-                
-                free(pubKeyHex);
-                free(strideHex);
+                printf("\rT%d SubVal:0x%s -> Result: %s (Prime: %llu)     ", 
+                       thread_number, hextemp, resultPubKeyHex, current_prime);
+            } else if (FLAGRANDOMMULTIPLE) {
+                printf("\rT%d SubVal:0x%s -> Result: %s (Random Multiple)     ", 
+                       thread_number, hextemp, resultPubKeyHex);
             } else {
-                printf("\r[+] Thread %d subtracting 0x%s     ", thread_number, hextemp);
+                printf("\rT%d SubVal:0x%s -> Result: %s (Steps: %lu)     ", 
+                       thread_number, hextemp, resultPubKeyHex, steps[thread_number]);
             }
+            
             fflush(stdout);
             free(hextemp);
+            free(subPubKeyHex);
+            free(resultPubKeyHex);
             THREADOUTPUT = 1;
         }
         
-        // Check if we've exceeded the range - but only exit if we're NOT in optimized prime mode
-        // In optimized prime mode, we'll keep going and adjust our strategy
-        if (subtractValue.IsGreater(&n_range_end) && !FLAGOPTIMIZEDPRIME) {
+        // Check if we've exceeded the thread's range - for normal mode only
+        if (!FLAGOPTIMIZEDPRIME && !FLAGRANDOMMULTIPLE && subtractValue.IsGreater(&thread_end_range)) {
             if (FLAGDEBUG) {
-                printf("[D] Thread %d exceeded range, stopping\n", thread_number);
+                printf("[D] Thread %d exceeded its range, stopping\n", thread_number);
             }
             continue_flag = 0;
             break;
@@ -3448,26 +3613,33 @@ void *thread_process_subtract(void *vargp)
             r = bloom_check(&bloom_subtract, xpoint_raw, 32);
             
             if (r) {
-                // If found, verify the result and report
-                printf("\n[+] Thread %d found possible matching public key using subtract value!\n", thread_number);
-                write_subtract_key(subtractValue, k);
-                subtractKeyFound[k] = true;
-                match_found = true;
-                
-                // Check if all keys have been found
-                all_keys_found = true;
-                for (size_t j = 0; j < subtractKeyFound.size(); j++) {
-                    if (!subtractKeyFound[j]) {
-                        all_keys_found = false;
-                        break;
+                // If found, verify the result against the file
+                if (verify_pubkey_in_file(resultPoint)) {
+                    printf("\n[+] Thread %d found verified matching public key using subtract value!\n", thread_number);
+                    write_subtract_key(subtractValue, k);
+                    subtractKeyFound[k] = true;
+                    match_found = true;
+                    
+                    // Check if all keys have been found
+                    bool all_keys_found = true;
+                    for (size_t j = 0; j < subtractKeyFound.size(); j++) {
+                        if (!subtractKeyFound[j]) {
+                            all_keys_found = false;
+                            break;
+                        }
                     }
-                }
-                
-                if (all_keys_found) {
-                    printf("[+] All target keys have been found!\n");
-                    delete grp;
-                    ends[thread_number] = 1;
-                    return NULL;
+                    
+                    if (all_keys_found) {
+                        printf("[+] All target keys have been found!\n");
+                        delete grp;
+                        ends[thread_number] = 1;
+                        return NULL;
+                    }
+                } else {
+                    // False positive detected
+                    if (FLAGDEBUG) {
+                        printf("\n[I] Thread %d found Bloom filter match BUT VERIFICATION FAILED\n", thread_number);
+                    }
                 }
             }
             
@@ -3547,30 +3719,38 @@ void *thread_process_subtract(void *vargp)
                     r = bloom_check(&bloom_subtract, xpoint_raw, 32);
                     
                     if (r) {
-                        // Calculate the actual subtract value
-                        Int actualSubtractVal(subtractValue);
-                        actualSubtractVal.Sub(CPU_GRP_SIZE / 2);
-                        actualSubtractVal.Add(j);
-                        
-                        printf("\n[+] Thread %d found possible matching public key using subtract value!\n", thread_number);
-                        write_subtract_key(actualSubtractVal, k);
-                        subtractKeyFound[k] = true;
-                        match_found = true;
-                        
-                        // Check if all keys have been found
-                        all_keys_found = true;
-                        for (size_t j = 0; j < subtractKeyFound.size(); j++) {
-                            if (!subtractKeyFound[j]) {
-                                all_keys_found = false;
-                                break;
+                        // Verify against the file before accepting
+                        if (verify_pubkey_in_file(pts[j])) {
+                            // Calculate the actual subtract value
+                            Int actualSubtractVal(subtractValue);
+                            actualSubtractVal.Sub(CPU_GRP_SIZE / 2);
+                            actualSubtractVal.Add(j);
+                            
+                            printf("\n[+] Thread %d found verified matching public key using subtract value!\n", thread_number);
+                            write_subtract_key(actualSubtractVal, k);
+                            subtractKeyFound[k] = true;
+                            match_found = true;
+                            
+                            // Check if all keys have been found
+                            bool all_keys_found = true;
+                            for (size_t j = 0; j < subtractKeyFound.size(); j++) {
+                                if (!subtractKeyFound[j]) {
+                                    all_keys_found = false;
+                                    break;
+                                }
                             }
-                        }
-                        
-                        if (all_keys_found) {
-                            printf("[+] All target keys have been found!\n");
-                            delete grp;
-                            ends[thread_number] = 1;
-                            return NULL;
+                            
+                            if (all_keys_found) {
+                                printf("[+] All target keys have been found!\n");
+                                delete grp;
+                                ends[thread_number] = 1;
+                                return NULL;
+                            }
+                        } else {
+                            // False positive
+                            if (FLAGDEBUG) {
+                                printf("\n[I] Thread %d found Bloom filter match BUT VERIFICATION FAILED\n", thread_number);
+                            }
                         }
                     }
                 }
@@ -3579,46 +3759,47 @@ void *thread_process_subtract(void *vargp)
         
         // Increment for next iteration
         if (FLAGOPTIMIZEDPRIME) {
-            steps_taken++;
-            
             #if defined(_WIN64) && !defined(__CYGWIN__)
             WaitForSingleObject(bsgs_thread, INFINITE);
             #else
             pthread_mutex_lock(&bsgs_thread);
             #endif
             
+            // Each thread processes its own step count
+            steps_taken++;
+            
+            // Check if it's time to move to next prime
             if (steps_taken >= current_prime) {
-                // Time to move to next prime
-                current_prime = next_prime(current_prime);
-                steps_taken = 0;
-                current_prime_int.SetInt64(current_prime);
-                
-                // Recalculate stride
-                calculate_prime_stride(n_range_diff, current_prime_int, thread_specific_stride);
-                
-                // For optimized prime mode, reset key_mpz back to start range periodically
-                // This prevents us from going too far outside the range
-                if (thread_number == 0) {
-                    key_mpz.Set(&n_range_start);
-                } else {
-                    // Keep threads separated
-                    key_mpz.Set(&n_range_start);
-                    Int thread_offset;
-                    thread_offset.Set(&subtractStride);
-                    thread_offset.Mult(thread_number);
-                    key_mpz.Add(&thread_offset);
+                // Find next prime number for this thread
+                // Skip NTHREADS prime numbers to avoid overlap with other threads
+                for (int i = 0; i < NTHREADS; i++) {
+                    current_prime = next_prime(current_prime);
                 }
+                
+                steps_taken = 0;
                 
                 if (!FLAGQUIET) {
-                    char *stride_str = thread_specific_stride.GetBase10();
-                    printf("\r[+] Moving to prime: %llu with stride: %s  \r", 
-                           current_prime, stride_str);
-                    free(stride_str);
+                    printf("\r[+] Thread %d moving to prime: %llu  \r", thread_number, current_prime);
                     fflush(stdout);
                 }
-            } else {
-                // Regular increment using the calculated stride
-                key_mpz.Add(&thread_specific_stride);
+                
+                // Update current_prime_int
+                current_prime_int.SetInt64(current_prime);
+                
+                // Recalculate stride for this prime
+                calculate_prime_stride(range_size, current_prime_int, thread_specific_stride);
+            }
+            
+            // Increment based on the current stride
+            key_mpz.Add(&thread_specific_stride);
+            
+            // Wrap around if we exceed the thread's range
+            if (key_mpz.IsGreater(&thread_end_range)) {
+                key_mpz.Set(&thread_start_range);
+                
+                if (FLAGDEBUG) {
+                    printf("[D] Thread %d wrapped around to start of range\n", thread_number);
+                }
             }
             
             #if defined(_WIN64) && !defined(__CYGWIN__)
@@ -3626,12 +3807,12 @@ void *thread_process_subtract(void *vargp)
             #else
             pthread_mutex_unlock(&bsgs_thread);
             #endif
-        } else {
-            // Increment by NTHREADS*stride for next iteration, so each thread covers a unique range
+        } else if (!FLAGRANDOMMULTIPLE) {
+            // Regular non-optimized mode - increment by stride
             key_mpz.Add(&thread_specific_stride);
             
             // If we've reached the end of our range and not in optimized prime mode, we're done
-            if (key_mpz.IsGreater(&n_range_end)) {
+            if (key_mpz.IsGreater(&thread_end_range)) {
                 continue_flag = 0;
             }
         }
@@ -3644,8 +3825,6 @@ void *thread_process_subtract(void *vargp)
     delete grp;
     return NULL;
 }
-
-
 
 #if defined(_WIN64) && !defined(__CYGWIN__)
 DWORD WINAPI thread_process(LPVOID vargp)
@@ -7543,6 +7722,9 @@ void menu()
     printf("-t tn       Threads number, must be a positive integer\n");
     printf("-v value    Search for vanity Address, only with -m vanity\n");
     printf("-z value    Bloom size multiplier, only address,rmd160,vanity, xpoint, value >= 1\n");
+    printf("-o          optimized prime mode, uses prime number as step count\n");
+    printf("-O value    Starting prime number for optimized prime mode (used with -o)\n");
+    printf("-P pubkey   takes publickeys from cmd line seperated by ,\n");
     printf("\nExample:\n\n");
     printf("./keyhunt -m rmd160 -f tests/unsolvedpuzzles.rmd -b 66 -l compress -R -q -t 8\n\n");
     printf("This line runs the program with 8 threads from the range 20000000000000000 to 40000000000000000 without stats output\n\n");
