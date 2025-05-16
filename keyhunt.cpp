@@ -369,6 +369,7 @@ int KFACTOR = 1;
 int MAXLENGTHADDRESS = -1;
 int NTHREADS = 1;
 int FLAGRANDOMMULTIPLE = 0;
+int FLAGEVENLYDISTRIBUTE = 0;
 
 int FLAGSAVEREADFILE = 0;
 int FLAGREADEDFILE1 = 0;
@@ -570,6 +571,10 @@ int main(int argc, char **argv)
 {
     switch (c)
     {
+        case 'E':
+            FLAGEVENLYDISTRIBUTE = 1;
+            printf("[+] Evenly distributed pubkey generation mode enabled\n");
+            break;
         case 'X':  // Use 'X' for random multiple mode
             FLAGRANDOMMULTIPLE = 1;
             printf("[+] Random Multiple mode enabled\n");
@@ -3866,6 +3871,198 @@ void *thread_process(void *vargp)
     free(tt);
     grp->Set(dx);
 
+   // Evenly Distributed Mode implementation
+if (FLAGEVENLYDISTRIBUTE && FLAGPRINTPUBKEYS && max_pubkeys_to_generate > 0) {
+    // Calculate thread-specific range
+    Int thread_range_size, thread_step_size, thread_start, thread_end;
+    Int num_keys_per_thread;
+    
+    // Total keys divided by number of threads
+    Int total_keys;
+    total_keys.SetInt64(max_pubkeys_to_generate);
+    Int nThreadsInt;
+    nThreadsInt.SetInt32(NTHREADS);
+    num_keys_per_thread.Set(&total_keys);
+    num_keys_per_thread.Div(&nThreadsInt);
+    
+    if (thread_number == NTHREADS - 1) {
+        // Last thread gets any remainder keys
+        Int keys_assigned;
+        keys_assigned.Set(&num_keys_per_thread);
+        keys_assigned.Mult(NTHREADS - 1);
+        num_keys_per_thread.Set(&total_keys);
+        num_keys_per_thread.Sub(&keys_assigned);
+    }
+    
+    // Calculate this thread's range
+    thread_range_size.Set(&n_range_diff);
+    thread_range_size.Div(&nThreadsInt);
+    
+    thread_start.Set(&n_range_start);
+    Int thread_offset;
+    thread_offset.Set(&thread_range_size);
+    Int threadNumInt;
+    threadNumInt.SetInt32(thread_number);
+    thread_offset.Mult(&threadNumInt);
+    thread_start.Add(&thread_offset);
+    
+    thread_end.Set(&thread_start);
+    thread_end.Add(&thread_range_size);
+    
+    // Ensure last thread goes to end of range
+    if (thread_number == NTHREADS - 1) {
+        thread_end.Set(&n_range_end);
+    }
+    
+    // Calculate key step size for this thread
+    thread_step_size.Set(&thread_range_size);
+    thread_step_size.Div(&num_keys_per_thread);
+    
+    // For very large ranges, ensure we don't have a step size of 0
+    if (thread_step_size.IsZero()) {
+        thread_step_size.SetInt32(1);
+    }
+    
+    // Display thread-specific information
+    char *start_hex = thread_start.GetBase16();
+    char *end_hex = thread_end.GetBase16();
+    char *step_hex = thread_step_size.GetBase16();
+    printf("[+] Thread %d: Range 0x%s to 0x%s, Step 0x%s (%llu keys)\n", 
+           thread_number, start_hex, end_hex, step_hex, 
+           num_keys_per_thread.GetInt64());
+    free(start_hex);
+    free(end_hex);
+    free(step_hex);
+    
+    // Initialize batching and progress tracking
+    uint64_t batch_size = 10000; // Keys per progress update
+    uint64_t total_keys_generated = 0;
+    time_t start_time = time(NULL);
+    time_t last_update_time = start_time;
+    
+    // Generate keys evenly across thread's range
+    Int current_key;
+    current_key.Set(&thread_start);
+    Point publicKey;
+    unsigned char binPubKey[33];
+    
+    uint64_t thread_max_keys = num_keys_per_thread.GetInt64();
+    
+    while (total_keys_generated < thread_max_keys) {
+        // Check if we've reached the end of the range
+        if (current_key.IsGreaterOrEqual(&thread_end)) {
+            printf("[+] Thread %d reached end of range after %llu keys\n", 
+                   thread_number, total_keys_generated);
+            break;
+        }
+        
+        // Generate the public key for the current private key
+        publicKey = secp->ComputePublicKey(&current_key);
+        
+        // Create 33-byte binary compressed public key
+        binPubKey[0] = publicKey.y.IsEven() ? 0x02 : 0x03;
+        publicKey.x.Get32Bytes(binPubKey + 1);
+        
+        // Add to thread's buffer
+        add_pubkey_to_buffer(binPubKey, thread_number);
+        
+        // Move to the next key
+        current_key.Add(&thread_step_size);
+        
+        // Increment counters
+        total_keys_generated++;
+        
+        // Update progress periodically
+        if (total_keys_generated % batch_size == 0 || total_keys_generated == thread_max_keys) {
+            time_t current_time = time(NULL);
+            double elapsed_time = difftime(current_time, start_time);
+            
+            if (elapsed_time > 0) {
+                double keys_per_sec = total_keys_generated / elapsed_time;
+                double percent_complete = (thread_max_keys > 0) ? 100.0 * total_keys_generated / thread_max_keys : 0.0;
+                
+                // Only one thread (thread 0) should print to avoid messy output
+                if (thread_number == 0 || FLAGQUIET == 0) {
+                    printf("\r[+] Thread %d: %llu/%llu keys (%.1f%%) at %.1f keys/sec%s", 
+                           thread_number, total_keys_generated, thread_max_keys, 
+                           percent_complete, keys_per_sec, 
+                           thread_number == 0 ? "                    " : "");
+                    fflush(stdout);
+                }
+            }
+        }
+        
+        // Check if should continue or if requested number is reached
+        if (total_keys_written >= max_pubkeys_to_generate) {
+            break;
+        }
+        
+        // Increment step counter for stats
+        steps[thread_number]++;
+    }
+    
+    // Final stats for this thread
+    time_t end_time = time(NULL);
+    double total_time = difftime(end_time, start_time);
+    if (total_time > 0 && !FLAGQUIET) {
+        printf("\n[+] Thread %d completed: %llu keys in %.1f seconds (%.1f keys/sec)\n", 
+               thread_number, total_keys_generated, total_time, 
+               total_keys_generated / total_time);
+    }
+    
+    // ADDED: Force flush any remaining keys in thread buffer for this thread
+    for (int i = 0; i < NUM_BUFFERS; i++) {
+        if (i == thread_number && thread_buffers[i].count > 0) {
+            #if defined(_WIN64) && !defined(__CYGWIN__)
+            WaitForSingleObject(thread_buffers[i].mutex, INFINITE);
+            #else
+            pthread_mutex_lock(&thread_buffers[i].mutex);
+            #endif
+            
+            // Set the ready flag to ensure the writer thread processes this buffer
+            thread_buffers[i].ready = true;
+            
+            // Also manually write the keys if this is the last thread to finish
+            if (thread_number == NTHREADS - 1 || total_keys_generated == thread_max_keys) {
+                if (pubkeyfile != NULL) {
+                    #if defined(_WIN64) && !defined(__CYGWIN__)
+                    WaitForSingleObject(write_keys, INFINITE);
+                    #else
+                    pthread_mutex_lock(&write_keys);
+                    #endif
+                    
+                    // Write any remaining keys directly
+                    fwrite(thread_buffers[i].keys, 33, thread_buffers[i].count, pubkeyfile);
+                    total_keys_written += thread_buffers[i].count;
+                    thread_buffers[i].count = 0;
+                    
+                    // Force flush to disk
+                    fflush(pubkeyfile);
+                    
+                    printf("\n[+] Thread %d: Flushed remaining keys to disk\n", thread_number);
+                    
+                    #if defined(_WIN64) && !defined(__CYGWIN__)
+                    ReleaseMutex(write_keys);
+                    #else
+                    pthread_mutex_unlock(&write_keys);
+                    #endif
+                }
+            }
+            
+            #if defined(_WIN64) && !defined(__CYGWIN__)
+            ReleaseMutex(thread_buffers[i].mutex);
+            #else
+            pthread_mutex_unlock(&thread_buffers[i].mutex);
+            #endif
+        }
+    }
+    
+    ends[thread_number] = 1;
+    delete grp;
+    return NULL;
+}
+
+    // Original thread_process code for non-evenly distributed mode
     do
     {
         if (FLAGRANDOM)
@@ -4514,7 +4711,9 @@ void *thread_process(void *vargp)
             } while (count < N_SEQUENTIAL_MAX && continue_flag);
         }
     } while (continue_flag);
+    
     ends[thread_number] = 1;
+    delete grp;
     return NULL;
 }
 
