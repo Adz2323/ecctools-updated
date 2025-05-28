@@ -525,3 +525,23 @@ bool sha256_file(const char* file_name, uint8_t* checksum) {
 	fclose(file);
 	return true;
 }
+
+void hash_sha256_with_seed(const unsigned char *data, size_t data_len, 
+    const unsigned char *seed, size_t seed_len, 
+    unsigned char *output) {
+// Allocate temporary buffer for combined data
+unsigned char *combined = (unsigned char *)malloc(data_len + seed_len);
+if (!combined) {
+fprintf(stderr, "[E] Failed to allocate memory for seeded hash\n");
+return;
+}
+
+// Copy data and seed into the combined buffer
+memcpy(combined, data, data_len);
+memcpy(combined + data_len, seed, seed_len);
+
+// Use the existing sha256 function
+sha256(combined, data_len + seed_len, output);
+
+free(combined);
+}
