@@ -1781,10 +1781,10 @@ int main(int argc, char **argv) {
                 if(FLAGMULTITARGET && bsgs_point_number > 1) {
                     sprintf(extended_buffer, "\r[+] Total %s keys in %s seconds: %s keys/s | MT: %d targets | Mode: %s | √%d speedup%*s\r", 
                             str_total, str_seconds, str_pretotal, bsgs_point_number,
-                            bsgs_modes[FLAGBSGSMODE], bsgs_point_number, 200, "");
+                            bsgs_modes[FLAGBSGSMODE], bsgs_point_number, 100, "");
                 } else {
                     sprintf(extended_buffer, "\r[+] Total %s keys in %s seconds: %s keys/s | Mode: %s%*s\r", 
-                            str_total, str_seconds, str_pretotal, bsgs_modes[FLAGBSGSMODE], 200, "");
+                            str_total, str_seconds, str_pretotal, bsgs_modes[FLAGBSGSMODE], 120, "");
                 }
             }
             else {
@@ -1809,12 +1809,12 @@ int main(int argc, char **argv) {
                             str_total, str_seconds, str_divpretotal, 
                             str_limits_prefixs[salir ? i : i-1], str_pretotal,
                             bsgs_point_number, bsgs_modes[FLAGBSGSMODE], 
-                            bsgs_point_number, 200, "");
+                            bsgs_point_number, 80, "");
                 } else {
                     sprintf(extended_buffer, "\r[+] Total %s keys in %s seconds: ~%s %s (%s keys/s) | Mode: %s | Threads: %d%*s\r", 
                             str_total, str_seconds, str_divpretotal, 
                             str_limits_prefixs[salir ? i : i-1], str_pretotal,
-                            bsgs_modes[FLAGBSGSMODE], NTHREADS, 200, "");
+                            bsgs_modes[FLAGBSGSMODE], NTHREADS, 100, "");
                 }
                 
                 free(str_divpretotal);
