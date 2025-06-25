@@ -66,6 +66,14 @@ email: albertobsd@gmail.com
 
 uint32_t THREADBPWORKLOAD = 1048576;
 
+struct subtractBPload {
+    uint32_t threadid;
+    uint64_t from;
+    uint64_t to;
+    uint64_t workload;
+    uint32_t finished;
+};
+
 struct checksumsha256
 {
     char data[32];
@@ -77,6 +85,8 @@ struct PubkeyBuffer
     unsigned char *keys;
     size_t count;
     bool ready;
+
+
 #if defined(_WIN64) && !defined(__CYGWIN__)
     HANDLE mutex;
 #else
@@ -84,17 +94,23 @@ struct PubkeyBuffer
 #endif
 };
 
+
 PubkeyBuffer *thread_buffers;
 volatile bool writer_running = true;
 uint64_t total_keys_written = 0;
+
+
 #if defined(_WIN64) && !defined(__CYGWIN__)
 HANDLE writer_thread;
 HANDLE buffer_ready_event;
+HANDLE *subtract_bloom_mutex = NULL;
 #else
 pthread_t writer_thread;
 pthread_cond_t buffer_ready_cond;
 pthread_mutex_t buffer_ready_mutex;
+pthread_mutex_t *subtract_bloom_mutex = NULL;
 #endif
+
 
 struct bsgs_xvalue
 {
@@ -223,6 +239,10 @@ void checkpointer(void *ptr, const char *file, const char *function, const char 
 bool isBase58(char c);
 bool isValidBase58String(char *str);
 
+void displayBloomEstimate(uint64_t num_items);
+bool generateSubtractedKeysToBloom(const char* params, const char* originPubkeyHex);
+bool loadSubtractedKeysToBloom();
+
 bool readFileAddress(char *fileName);
 bool readFileVanity(char *fileName);
 bool forceReadFileAddress(char *fileName);
@@ -245,7 +265,7 @@ void calculate_prime_stride(Int &range_diff, Int &current_prime_int, Int &stride
 uint64_t next_prime(uint64_t n);
 bool is_prime(uint64_t n);
 bool verify_pubkey_in_file(Point &resultPoint);
-
+void generate_evenly_distributed_keys();
 
 
 #if defined(_WIN64) && !defined(__CYGWIN__)
@@ -258,9 +278,10 @@ DWORD WINAPI thread_process_bsgs_both(LPVOID vargp);
 DWORD WINAPI thread_process_bsgs_random(LPVOID vargp);
 DWORD WINAPI thread_process_bsgs_dance(LPVOID vargp);
 DWORD WINAPI thread_process_bsgs_levy(LPVOID vargp);
-DWORD WINAPI thread_process_subtract(LPVOID vargp);  // Add this line
+DWORD WINAPI thread_process_subtract(LPVOID vargp);
 DWORD WINAPI thread_bPload(LPVOID vargp);
 DWORD WINAPI thread_bPload_2blooms(LPVOID vargp);
+DWORD WINAPI thread_subtract_bloom_load(LPVOID vargp);
 #else
 void *thread_process_vanity(void *vargp);
 void *thread_process_minikeys(void *vargp);
@@ -271,9 +292,10 @@ void *thread_process_bsgs_both(void *vargp);
 void *thread_process_bsgs_random(void *vargp);
 void *thread_process_bsgs_dance(void *vargp);
 void *thread_process_bsgs_levy(void *vargp);
-void *thread_process_subtract(void *vargp);  // Add this line
+void *thread_process_subtract(void *vargp);
 void *thread_bPload(void *vargp);
 void *thread_bPload_2blooms(void *vargp);
+void *thread_subtract_bloom_load(void *vargp);
 #endif
 
 char *pubkeytopubaddress(char *pkey, int length);
@@ -302,7 +324,14 @@ HANDLE write_keys;
 HANDLE write_random;
 HANDLE bsgs_thread;
 HANDLE *bPload_mutex = NULL;
+HANDLE writer_thread;
+HANDLE buffer_ready_event;
+HANDLE *subtract_bloom_mutex = NULL;
 #else
+pthread_t writer_thread;
+pthread_cond_t buffer_ready_cond;
+pthread_mutex_t buffer_ready_mutex;
+pthread_mutex_t *subtract_bloom_mutex = NULL;
 pthread_t *tid = NULL;
 pthread_mutex_t write_keys;
 pthread_mutex_t write_random;
@@ -354,6 +383,13 @@ uint64_t steps_taken = 0;     // Count steps taken with current prime
 uint64_t starting_prime = 2;
 uint64_t global_steps_taken = 0;  // Global step counter for optimized prime mode
 Int global_base_key;              // Base key for the current prime cycle
+
+
+//Xpoint Bloom Load
+bool FLAGSUBTRACTBLOOM = false;
+uint64_t subtract_bloom_count = 0;
+Int subtract_bloom_spacing;
+Point subtract_bloom_origin;
 
 int FLAGSKIPCHECKSUM = 0;
 int FLAGENDOMORPHISM = 0;
@@ -566,12 +602,12 @@ int main(int argc, char **argv)
 #endif
 
     printf("[+] Version %s, developed by AlbertoBSD\n", version);
-
-    while ((c = getopt(argc, argv, "deh6MoqRSB:b:c:C:E:f:I:k:L:l:m:N:n:p:P:r:s:t:v:V:G:8:z:O:X")) != -1)
+    
+    while ((c = getopt(argc, argv, "deh6MoqRSEB:b:c:C:E:f:I:k:L:l:m:N:n:p:P:r:s:t:v:V:G:8:z:O:X")) != -1)
 {
     switch (c)
     {
-        case 'E':
+         case 'E':
             FLAGEVENLYDISTRIBUTE = 1;
             printf("[+] Evenly distributed pubkey generation mode enabled\n");
             break;
@@ -970,6 +1006,20 @@ int main(int argc, char **argv)
         }
     }
 
+    if (FLAGFILE && FLAGMODE == MODE_XPOINT && strncmp(fileName, "subtract", 8) == 0) {
+    // Find the -p parameter from targetSubtractKeyStrs
+    if (targetSubtractKeyStrs.empty()) {
+        fprintf(stderr, "[E] Subtract bloom mode requires -p parameter with origin public key\n");
+        exit(EXIT_FAILURE);
+    }
+    
+    if (!generateSubtractedKeysToBloom(fileName, targetSubtractKeyStrs[0].c_str())) {
+        fprintf(stderr, "[E] Failed to parse subtract bloom parameters\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
+
     if (FLAGBSGSMODE == MODE_BSGS && FLAGENDOMORPHISM)
     {
         fprintf(stderr, "[E] Endomorphism doesn't work with BSGS\n");
@@ -1193,6 +1243,12 @@ case MODE_SUBTRACT:
             printf(" done! %" PRIu64 " values were loaded and sorted\n", N);
             writeFileIfNeeded(fileName);
         }
+    }
+
+    if (FLAGPRINTPUBKEYS && FLAGEVENLYDISTRIBUTE) {
+        // Skip the normal thread processing and generate evenly distributed keys instead
+        generate_evenly_distributed_keys();
+        exit(EXIT_SUCCESS);
     }
     // Add this after processing all options
 if (FLAGOPTIMIZEDPRIME && FLAGSTRIDE && !stride.IsOne()) {
@@ -2849,6 +2905,484 @@ case MODE_SUBTRACT:
     return 0;
 }
 
+// Function to display bloom filter size estimate
+void displayBloomEstimate(uint64_t num_items) {
+    // Calculate bloom filter size using the same formula as bloom_init2
+    double fp_rate = (num_items <= 10000) ? 0.001 : 0.001;
+    uint64_t bits_needed = (uint64_t)((-1.0 * num_items * FLAGBLOOMMULTIPLIER * log(fp_rate)) / (log(2.0) * log(2.0)));
+    uint64_t bytes_needed = bits_needed / 8;
+    
+    double mb_size = bytes_needed / (1024.0 * 1024.0);
+    double gb_size = mb_size / 1024.0;
+    
+    printf("[+] Estimated bloom filter size for %llu elements:\n", num_items);
+    if (gb_size >= 1.0) {
+        printf("    %.2f GB (%.2f MB)\n", gb_size, mb_size);
+    } else {
+        printf("    %.2f MB\n", mb_size);
+    }
+    
+    // Check available memory
+#if defined(_WIN64) && !defined(__CYGWIN__)
+    MEMORYSTATUSEX statex;
+    statex.dwLength = sizeof(statex);
+    GlobalMemoryStatusEx(&statex);
+    DWORDLONG available_memory = statex.ullAvailPhysMem / (1024 * 1024);
+    printf("[+] Available system memory: %llu MB\n", available_memory);
+    
+    if (mb_size > available_memory * 0.95) {
+        fprintf(stderr, "[W] Warning: Bloom filter size exceeds available memory!\n");
+        fprintf(stderr, "[W] Consider reducing the number of keys or using -z option\n");
+    }
+#else
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long page_size = sysconf(_SC_PAGE_SIZE);
+    uint64_t available_memory = ((uint64_t)pages * (uint64_t)page_size) / (1024 * 1024);
+    printf("[+] Available system memory: %lu MB\n", available_memory);
+    
+    if (mb_size > available_memory * 0.95) {
+        fprintf(stderr, "[W] Warning: Bloom filter size exceeds available memory!\n");
+        fprintf(stderr, "[W] Consider reducing the number of keys or using -z option\n");
+    }
+#endif
+}
+
+// Function to parse subtract bloom parameters
+bool generateSubtractedKeysToBloom(const char* params, const char* originPubkeyHex) {
+    // Parse the parameters: "subtract count spacing"
+    char* paramsCopy = strdup(params);
+    char* token = strtok(paramsCopy, " ");
+    
+    if (!token || strcmp(token, "subtract") != 0) {
+        fprintf(stderr, "[E] Invalid subtract bloom format. Expected: -f \"subtract count spacing\"\n");
+        free(paramsCopy);
+        return false;
+    }
+    
+    // Get count
+    token = strtok(NULL, " ");
+    if (!token) {
+        fprintf(stderr, "[E] Missing count in subtract bloom parameters\n");
+        free(paramsCopy);
+        return false;
+    }
+    subtract_bloom_count = strtoull(token, NULL, 10);
+    
+    // Get spacing
+    token = strtok(NULL, " ");
+    if (!token) {
+        fprintf(stderr, "[E] Missing spacing in subtract bloom parameters\n");
+        free(paramsCopy);
+        return false;
+    }
+    
+    // Parse spacing (handle hex with 0x prefix)
+    if (token[0] == '0' && token[1] == 'x') {
+        subtract_bloom_spacing.SetBase16(token + 2);
+    } else {
+        subtract_bloom_spacing.SetBase10(token);
+    }
+    
+    free(paramsCopy);
+    
+    // Parse the origin public key
+    if (!originPubkeyHex || strlen(originPubkeyHex) == 0) {
+        fprintf(stderr, "[E] Origin public key required for subtract bloom mode\n");
+        return false;
+    }
+    
+    bool isCompressed = false;
+    size_t len = strlen(originPubkeyHex);
+    
+    if (len == 66) {
+        isCompressed = true;
+    } else if (len == 130) {
+        isCompressed = false;
+    } else {
+        fprintf(stderr, "[E] Invalid public key length: %zu\n", len);
+        return false;
+    }
+    
+    if (!secp->ParsePublicKeyHex((char*)originPubkeyHex, subtract_bloom_origin, isCompressed)) {
+        fprintf(stderr, "[E] Failed to parse origin public key\n");
+        return false;
+    }
+    
+    printf("[+] Subtract bloom mode configuration:\n");
+    printf("    Origin pubkey: %s\n", originPubkeyHex);
+    printf("    Number of keys: %llu\n", subtract_bloom_count);
+    printf("    Spacing: %s\n", subtract_bloom_spacing.GetBase16());
+    
+    // Calculate and show the range that will be covered
+    Int total_range;
+    total_range.Set(&subtract_bloom_spacing);
+    total_range.Mult(subtract_bloom_count);
+    
+    printf("    Total range covered: %s\n", total_range.GetBase16());
+    
+    // Show bloom multiplier effect if set
+    if (FLAGBLOOMMULTIPLIER > 1) {
+        printf("    Bloom multiplier: %d (size will be %dx larger)\n", 
+               FLAGBLOOMMULTIPLIER, FLAGBLOOMMULTIPLIER);
+    }
+    
+    FLAGSUBTRACTBLOOM = true;
+    return true;
+}
+
+bool loadSubtractedKeysToBloom() {
+    printf("[+] Generating %llu subtracted keys with spacing %s\n", 
+           subtract_bloom_count, subtract_bloom_spacing.GetBase16());
+    
+    // Display bloom filter estimate BEFORE creating it
+    displayBloomEstimate(subtract_bloom_count);
+    
+    // Ask for confirmation if it's a large amount
+    if (subtract_bloom_count > 1000000000) { // More than 1 billion
+        printf("\n[!] This will generate over 1 billion keys. Continue? (y/n): ");
+        fflush(stdout);
+        char response = getchar();
+        if (response != 'y' && response != 'Y') {
+            printf("[+] Operation cancelled by user\n");
+            return false;
+        }
+        // Clear the newline
+        while (getchar() != '\n');
+    }
+    
+    printf("\n[+] Proceeding with key generation using %d threads...\n", NTHREADS);
+    
+    // Initialize bloom filter for the number of keys
+    N = subtract_bloom_count;
+    MAXLENGTHADDRESS = 20;
+    
+    // For large datasets, minimal addressTable
+    if (subtract_bloom_count > 10000000) {
+        printf("[+] Large dataset mode - using bloom filter only\n");
+        addressTable = (struct address_value *)malloc(sizeof(struct address_value) * 1);
+        N = 0;
+    } else {
+        addressTable = (struct address_value *)malloc(sizeof(struct address_value) * subtract_bloom_count);
+    }
+    
+    if (!addressTable) {
+        fprintf(stderr, "[E] Failed to allocate memory\n");
+        return false;
+    }
+    
+    // Initialize bloom filter
+    if (!initBloomFilter(&bloom, subtract_bloom_count)) {
+        free(addressTable);
+        return false;
+    }
+    
+    // Initialize mutexes for bloom filter access
+#if defined(_WIN64) && !defined(__CYGWIN__)
+    subtract_bloom_mutex = (HANDLE *)calloc(256, sizeof(HANDLE));
+    for (int i = 0; i < 256; i++) {
+        subtract_bloom_mutex[i] = CreateMutex(NULL, FALSE, NULL);
+    }
+    bPload_mutex = (HANDLE *)calloc(NTHREADS, sizeof(HANDLE));
+    for (int i = 0; i < NTHREADS; i++) {
+        bPload_mutex[i] = CreateMutex(NULL, FALSE, NULL);
+    }
+#else
+    subtract_bloom_mutex = (pthread_mutex_t *)calloc(256, sizeof(pthread_mutex_t));
+    for (int i = 0; i < 256; i++) {
+        pthread_mutex_init(&subtract_bloom_mutex[i], NULL);
+    }
+    bPload_mutex = (pthread_mutex_t *)calloc(NTHREADS, sizeof(pthread_mutex_t));
+    for (int i = 0; i < NTHREADS; i++) {
+        pthread_mutex_init(&bPload_mutex[i], NULL);
+    }
+#endif
+    
+    // Prepare thread workload
+    uint64_t WORKLOAD = 1048576; // 1M keys per batch
+    uint64_t THREADCYCLES = subtract_bloom_count / WORKLOAD;
+    uint64_t PERTHREAD_R = subtract_bloom_count % WORKLOAD;
+    if (PERTHREAD_R != 0) {
+        THREADCYCLES++;
+    }
+    
+    struct subtractBPload *bPload_temp_ptr = (struct subtractBPload *)calloc(NTHREADS, sizeof(struct subtractBPload));
+    char *bPload_threads_available = (char *)calloc(NTHREADS, sizeof(char));
+    memset(bPload_threads_available, 1, NTHREADS);
+    
+#if defined(_WIN64) && !defined(__CYGWIN__)
+    HANDLE *tid = (HANDLE *)calloc(NTHREADS, sizeof(HANDLE));
+#else
+    pthread_t *tid = (pthread_t *)calloc(NTHREADS, sizeof(pthread_t));
+#endif
+    
+    uint64_t BASE = 0;
+    uint64_t FINISHED_ITEMS = 0;
+    uint64_t FINISHED_THREADS_COUNTER = 0;
+    uint32_t THREADCOUNTER = 0;
+    int salir = 0;
+    
+    clock_t start_time = clock();
+    clock_t last_update = start_time;
+    
+    printf("\r[+] Processing 0/%llu keys (0.0%%)\r", subtract_bloom_count);
+    fflush(stdout);
+    
+    do {
+        for (int j = 0; j < NTHREADS && !salir; j++) {
+            if (bPload_threads_available[j] && !salir) {
+                bPload_threads_available[j] = 0;
+                bPload_temp_ptr[j].from = BASE;
+                bPload_temp_ptr[j].threadid = j;
+                bPload_temp_ptr[j].finished = 0;
+                
+                if (THREADCOUNTER < THREADCYCLES - 1) {
+                    bPload_temp_ptr[j].to = BASE + WORKLOAD;
+                    bPload_temp_ptr[j].workload = WORKLOAD;
+                } else {
+                    bPload_temp_ptr[j].to = BASE + WORKLOAD + PERTHREAD_R;
+                    bPload_temp_ptr[j].workload = WORKLOAD + PERTHREAD_R;
+                    salir = 1;
+                }
+                
+#if defined(_WIN64) && !defined(__CYGWIN__)
+                DWORD thread_id;
+                tid[j] = CreateThread(NULL, 0, thread_subtract_bloom_load, 
+                                    (void *)&bPload_temp_ptr[j], 0, &thread_id);
+#else
+                pthread_create(&tid[j], NULL, thread_subtract_bloom_load, 
+                             (void *)&bPload_temp_ptr[j]);
+                pthread_detach(tid[j]);
+#endif
+                
+                BASE += WORKLOAD;
+                THREADCOUNTER++;
+            }
+        }
+        
+        // Check thread completion
+        for (int j = 0; j < NTHREADS; j++) {
+            uint32_t finished;
+#if defined(_WIN64) && !defined(__CYGWIN__)
+            WaitForSingleObject(bPload_mutex[j], INFINITE);
+            finished = bPload_temp_ptr[j].finished;
+            ReleaseMutex(bPload_mutex[j]);
+#else
+            pthread_mutex_lock(&bPload_mutex[j]);
+            finished = bPload_temp_ptr[j].finished;
+            pthread_mutex_unlock(&bPload_mutex[j]);
+#endif
+            if (finished) {
+                bPload_temp_ptr[j].finished = 0;
+                bPload_threads_available[j] = 1;
+                FINISHED_ITEMS += bPload_temp_ptr[j].workload;
+                FINISHED_THREADS_COUNTER++;
+            }
+        }
+        
+        // Update progress
+        clock_t current_time = clock();
+        if ((current_time - last_update) / CLOCKS_PER_SEC >= 1 || FINISHED_THREADS_COUNTER >= THREADCYCLES) {
+            double progress = (double)FINISHED_ITEMS * 100.0 / subtract_bloom_count;
+            double elapsed = (double)(current_time - start_time) / CLOCKS_PER_SEC;
+            double rate = (elapsed > 0) ? FINISHED_ITEMS / elapsed : 0;
+            
+            printf("\r[+] Generated %llu/%llu keys (%.1f%%) at %.0f keys/sec", 
+                   FINISHED_ITEMS, subtract_bloom_count, progress, rate);
+            fflush(stdout);
+            
+            last_update = current_time;
+        }
+        
+    } while (FINISHED_THREADS_COUNTER < THREADCYCLES);
+    
+    clock_t end_time = clock();
+    double total_seconds = (double)(end_time - start_time) / CLOCKS_PER_SEC;
+    
+    printf("\n[+] Generated %llu subtracted keys in %.2f seconds (%.0f keys/sec)\n", 
+           subtract_bloom_count, total_seconds, subtract_bloom_count / total_seconds);
+    printf("[+] Bloom filter size: %.2f MB\n", 
+           (float)bloom.bytes / (1024.0 * 1024.0));
+    
+    // Cleanup
+    free(tid);
+    free(bPload_mutex);
+    free(bPload_temp_ptr);
+    free(bPload_threads_available);
+    
+#if defined(_WIN64) && !defined(__CYGWIN__)
+    for (int i = 0; i < 256; i++) {
+        CloseHandle(subtract_bloom_mutex[i]);
+    }
+#else
+    for (int i = 0; i < 256; i++) {
+        pthread_mutex_destroy(&subtract_bloom_mutex[i]);
+    }
+#endif
+    free(subtract_bloom_mutex);
+    
+    FLAGREADEDFILE1 = 1;
+    
+    return true;
+}
+
+// Improved function with batched processing
+void generate_evenly_distributed_keys() {
+    if (!FLAGPRINTPUBKEYS || max_pubkeys_to_generate == 0) {
+        printf("[E] Evenly distributed mode requires -p option with a value\n");
+        return;
+    }
+    
+    if (!FLAGRANGE) {
+        printf("[E] Evenly distributed mode requires a range (-r option)\n");
+        return;
+    }
+    
+    printf("[+] Generating %llu evenly distributed public keys across the specified range\n", max_pubkeys_to_generate);
+    
+    // Calculate the step size
+    Int step_size;
+    step_size.Set(&n_range_diff);
+    Int num_keys;
+    num_keys.SetInt64(max_pubkeys_to_generate);
+    step_size.Div(&num_keys);
+    
+    // For very large ranges, ensure we don't have a step size of 0
+    if (step_size.IsZero()) {
+        printf("[W] Range is too large relative to number of keys - using minimum step size\n");
+        step_size.SetInt32(1);
+    }
+    
+    // Display information about the generation
+    char *start_hex = n_range_start.GetBase16();
+    char *end_hex = n_range_end.GetBase16();
+    char *step_hex = step_size.GetBase16();
+    printf("[+] Range: 0x%s to 0x%s\n", start_hex, end_hex);
+    printf("[+] Step size: 0x%s\n", step_hex);
+    free(start_hex);
+    free(end_hex);
+    free(step_hex);
+    
+    // Define batch size - adjust based on memory constraints
+    // For very large jobs, use smaller batches
+    uint64_t batch_size = 1000000; // 1 million keys per batch
+    if (max_pubkeys_to_generate > 100000000) { // For really large jobs (> 100M)
+        batch_size = 100000; // Use smaller batches of 100K
+    }
+    
+    // Initialize progress tracking
+    uint64_t total_keys_generated = 0;
+    time_t start_time = time(NULL);
+    time_t last_update_time = start_time;
+    
+    // Generate keys in batches
+    Int current_key;
+    current_key.Set(&n_range_start);
+    Point publicKey;
+    unsigned char binPubKey[33];
+    
+    while (total_keys_generated < max_pubkeys_to_generate) {
+        // Calculate how many keys to generate in this batch
+        uint64_t keys_in_this_batch = batch_size;
+        if (total_keys_generated + batch_size > max_pubkeys_to_generate) {
+            keys_in_this_batch = max_pubkeys_to_generate - total_keys_generated;
+        }
+        
+        // Process this batch
+        for (uint64_t i = 0; i < keys_in_this_batch; i++) {
+            // Check if we've reached the end of the range
+            if (current_key.IsGreaterOrEqual(&n_range_end)) {
+                printf("[+] Reached end of range after %llu keys\n", total_keys_generated);
+                break;
+            }
+            
+            // Generate the public key for the current private key
+            publicKey = secp->ComputePublicKey(&current_key);
+            
+            // Create 33-byte binary compressed public key
+            binPubKey[0] = publicKey.y.IsEven() ? 0x02 : 0x03;
+            publicKey.x.Get32Bytes(binPubKey + 1);
+            
+            // Write to the binary file directly
+            fwrite(binPubKey, 1, 33, pubkeyfile);
+            
+            // Move to the next key
+            current_key.Add(&step_size);
+            
+            // Increment counters
+            total_keys_generated++;
+            pubkeys_generated++;
+        }
+        
+        // Update progress after each batch
+        time_t current_time = time(NULL);
+        double elapsed_time = difftime(current_time, start_time);
+        double batch_time = difftime(current_time, last_update_time);
+        
+        // Calculate rates
+        double overall_rate = (elapsed_time > 0) ? total_keys_generated / elapsed_time : 0;
+        double batch_rate = (batch_time > 0) ? keys_in_this_batch / batch_time : 0;
+        
+        // Format progress information
+        printf("\r[+] Generated %llu/%llu keys (%.2f%%) | ", 
+               total_keys_generated, max_pubkeys_to_generate, 
+               (float)total_keys_generated * 100.0 / max_pubkeys_to_generate);
+        
+        // Format rates with appropriate unit (keys/s, keys/min, etc.)
+        if (overall_rate > 1000000) {
+            printf("Overall: %.2f M keys/s", overall_rate / 1000000);
+        } else if (overall_rate > 1000) {
+            printf("Overall: %.2f K keys/s", overall_rate / 1000);
+        } else {
+            printf("Overall: %.2f keys/s", overall_rate);
+        }
+        
+        if (batch_rate > 1000000) {
+            printf(" | Current: %.2f M keys/s", batch_rate / 1000000);
+        } else if (batch_rate > 1000) {
+            printf(" | Current: %.2f K keys/s", batch_rate / 1000);
+        } else {
+            printf(" | Current: %.2f keys/s", batch_rate);
+        }
+        
+        // If we have enough information, estimate time remaining
+        if (elapsed_time > 10 && overall_rate > 0) {
+            uint64_t keys_remaining = max_pubkeys_to_generate - total_keys_generated;
+            double seconds_remaining = keys_remaining / overall_rate;
+            
+            // Format time remaining
+            if (seconds_remaining > 86400) { // > 1 day
+                printf(" | ETA: %.1f days", seconds_remaining / 86400);
+            } else if (seconds_remaining > 3600) { // > 1 hour
+                printf(" | ETA: %.1f hours", seconds_remaining / 3600);
+            } else if (seconds_remaining > 60) { // > 1 minute
+                printf(" | ETA: %.1f mins", seconds_remaining / 60);
+            } else {
+                printf(" | ETA: %.1f secs", seconds_remaining);
+            }
+        }
+        
+        fflush(stdout);
+        last_update_time = current_time;
+        
+        // Flush to disk periodically to avoid losing data
+        fflush(pubkeyfile);
+    }
+    
+    // Final status update
+    time_t end_time = time(NULL);
+    double total_time = difftime(end_time, start_time);
+    printf("\n[+] Completed generating %llu evenly distributed public keys\n", pubkeys_generated);
+    printf("[+] Total time: %.2f seconds (%.2f keys/sec)\n", total_time, pubkeys_generated / total_time);
+    printf("[+] Keys saved to %s\n", pubkeyfile_name);
+    
+    // Close the file
+    fclose(pubkeyfile);
+    pubkeyfile = NULL;
+    
+    // Cleanup
+    cleanup_pubkey_writer();
+}
+
 bool verify_pubkey_in_file(Point &resultPoint) {
     // Use hardcoded filename - simple and reliable
     const char* hardcoded_filename = "134.bin";
@@ -3871,196 +4405,149 @@ void *thread_process(void *vargp)
     free(tt);
     grp->Set(dx);
 
-   // Evenly Distributed Mode implementation
-if (FLAGEVENLYDISTRIBUTE && FLAGPRINTPUBKEYS && max_pubkeys_to_generate > 0) {
-    // Calculate thread-specific range
-    Int thread_range_size, thread_step_size, thread_start, thread_end;
-    Int num_keys_per_thread;
-    
-    // Total keys divided by number of threads
-    Int total_keys;
-    total_keys.SetInt64(max_pubkeys_to_generate);
-    Int nThreadsInt;
-    nThreadsInt.SetInt32(NTHREADS);
-    num_keys_per_thread.Set(&total_keys);
-    num_keys_per_thread.Div(&nThreadsInt);
-    
-    if (thread_number == NTHREADS - 1) {
-        // Last thread gets any remainder keys
-        Int keys_assigned;
-        keys_assigned.Set(&num_keys_per_thread);
-        keys_assigned.Mult(NTHREADS - 1);
+    // Evenly Distributed Mode implementation
+    if (FLAGEVENLYDISTRIBUTE && FLAGPRINTPUBKEYS && max_pubkeys_to_generate > 0) {
+        // Calculate thread-specific range
+        Int thread_range_size, thread_step_size, thread_start, thread_end;
+        Int num_keys_per_thread;
+        
+        // Total keys divided by number of threads
+        Int total_keys;
+        total_keys.SetInt64(max_pubkeys_to_generate);
+        Int nThreadsInt;
+        nThreadsInt.SetInt32(NTHREADS);
         num_keys_per_thread.Set(&total_keys);
-        num_keys_per_thread.Sub(&keys_assigned);
-    }
-    
-    // Calculate this thread's range
-    thread_range_size.Set(&n_range_diff);
-    thread_range_size.Div(&nThreadsInt);
-    
-    thread_start.Set(&n_range_start);
-    Int thread_offset;
-    thread_offset.Set(&thread_range_size);
-    Int threadNumInt;
-    threadNumInt.SetInt32(thread_number);
-    thread_offset.Mult(&threadNumInt);
-    thread_start.Add(&thread_offset);
-    
-    thread_end.Set(&thread_start);
-    thread_end.Add(&thread_range_size);
-    
-    // Ensure last thread goes to end of range
-    if (thread_number == NTHREADS - 1) {
-        thread_end.Set(&n_range_end);
-    }
-    
-    // Calculate key step size for this thread
-    thread_step_size.Set(&thread_range_size);
-    thread_step_size.Div(&num_keys_per_thread);
-    
-    // For very large ranges, ensure we don't have a step size of 0
-    if (thread_step_size.IsZero()) {
-        thread_step_size.SetInt32(1);
-    }
-    
-    // Display thread-specific information
-    char *start_hex = thread_start.GetBase16();
-    char *end_hex = thread_end.GetBase16();
-    char *step_hex = thread_step_size.GetBase16();
-    printf("[+] Thread %d: Range 0x%s to 0x%s, Step 0x%s (%llu keys)\n", 
-           thread_number, start_hex, end_hex, step_hex, 
-           num_keys_per_thread.GetInt64());
-    free(start_hex);
-    free(end_hex);
-    free(step_hex);
-    
-    // Initialize batching and progress tracking
-    uint64_t batch_size = 10000; // Keys per progress update
-    uint64_t total_keys_generated = 0;
-    time_t start_time = time(NULL);
-    time_t last_update_time = start_time;
-    
-    // Generate keys evenly across thread's range
-    Int current_key;
-    current_key.Set(&thread_start);
-    Point publicKey;
-    unsigned char binPubKey[33];
-    
-    uint64_t thread_max_keys = num_keys_per_thread.GetInt64();
-    
-    while (total_keys_generated < thread_max_keys) {
-        // Check if we've reached the end of the range
-        if (current_key.IsGreaterOrEqual(&thread_end)) {
-            printf("[+] Thread %d reached end of range after %llu keys\n", 
-                   thread_number, total_keys_generated);
-            break;
+        num_keys_per_thread.Div(&nThreadsInt);
+        
+        if (thread_number == NTHREADS - 1) {
+            // Last thread gets any remainder keys
+            Int keys_assigned;
+            keys_assigned.Set(&num_keys_per_thread);
+            keys_assigned.Mult(NTHREADS - 1);
+            num_keys_per_thread.Set(&total_keys);
+            num_keys_per_thread.Sub(&keys_assigned);
         }
         
-        // Generate the public key for the current private key
-        publicKey = secp->ComputePublicKey(&current_key);
+        // Calculate this thread's range
+        thread_range_size.Set(&n_range_diff);
+        thread_range_size.Div(&nThreadsInt);
         
-        // Create 33-byte binary compressed public key
-        binPubKey[0] = publicKey.y.IsEven() ? 0x02 : 0x03;
-        publicKey.x.Get32Bytes(binPubKey + 1);
+        thread_start.Set(&n_range_start);
+        Int thread_offset;
+        thread_offset.Set(&thread_range_size);
+        Int threadNumInt;
+        threadNumInt.SetInt32(thread_number);
+        thread_offset.Mult(&threadNumInt);
+        thread_start.Add(&thread_offset);
         
-        // Add to thread's buffer
-        add_pubkey_to_buffer(binPubKey, thread_number);
+        thread_end.Set(&thread_start);
+        thread_end.Add(&thread_range_size);
         
-        // Move to the next key
-        current_key.Add(&thread_step_size);
+        // Ensure last thread goes to end of range
+        if (thread_number == NTHREADS - 1) {
+            thread_end.Set(&n_range_end);
+        }
         
-        // Increment counters
-        total_keys_generated++;
+        // Calculate key step size for this thread
+        thread_step_size.Set(&thread_range_size);
+        thread_step_size.Div(&num_keys_per_thread);
         
-        // Update progress periodically
-        if (total_keys_generated % batch_size == 0 || total_keys_generated == thread_max_keys) {
-            time_t current_time = time(NULL);
-            double elapsed_time = difftime(current_time, start_time);
+        // For very large ranges, ensure we don't have a step size of 0
+        if (thread_step_size.IsZero()) {
+            thread_step_size.SetInt32(1);
+        }
+        
+        // Display thread-specific information
+        char *start_hex = thread_start.GetBase16();
+        char *end_hex = thread_end.GetBase16();
+        char *step_hex = thread_step_size.GetBase16();
+        printf("[+] Thread %d: Range 0x%s to 0x%s, Step 0x%s (%llu keys)\n", 
+               thread_number, start_hex, end_hex, step_hex, 
+               num_keys_per_thread.GetInt64());
+        free(start_hex);
+        free(end_hex);
+        free(step_hex);
+        
+        // Initialize batching and progress tracking
+        uint64_t batch_size = 10000; // Keys per progress update
+        uint64_t total_keys_generated = 0;
+        time_t start_time = time(NULL);
+        time_t last_update_time = start_time;
+        
+        // Generate keys evenly across thread's range
+        Int current_key;
+        current_key.Set(&thread_start);
+        Point publicKey;
+        unsigned char binPubKey[33];
+        
+        uint64_t thread_max_keys = num_keys_per_thread.GetInt64();
+        
+        while (total_keys_generated < thread_max_keys) {
+            // Check if we've reached the end of the range
+            if (current_key.IsGreaterOrEqual(&thread_end)) {
+                printf("[+] Thread %d reached end of range after %llu keys\n", 
+                       thread_number, total_keys_generated);
+                break;
+            }
             
-            if (elapsed_time > 0) {
-                double keys_per_sec = total_keys_generated / elapsed_time;
-                double percent_complete = (thread_max_keys > 0) ? 100.0 * total_keys_generated / thread_max_keys : 0.0;
+            // Generate the public key for the current private key
+            publicKey = secp->ComputePublicKey(&current_key);
+            
+            // Create 33-byte binary compressed public key
+            binPubKey[0] = publicKey.y.IsEven() ? 0x02 : 0x03;
+            publicKey.x.Get32Bytes(binPubKey + 1);
+            
+            // Add to thread's buffer
+            add_pubkey_to_buffer(binPubKey, thread_number);
+            
+            // Move to the next key
+            current_key.Add(&thread_step_size);
+            
+            // Increment counters
+            total_keys_generated++;
+            
+            // Update progress periodically
+            if (total_keys_generated % batch_size == 0 || total_keys_generated == thread_max_keys) {
+                time_t current_time = time(NULL);
+                double elapsed_time = difftime(current_time, start_time);
                 
-                // Only one thread (thread 0) should print to avoid messy output
-                if (thread_number == 0 || FLAGQUIET == 0) {
-                    printf("\r[+] Thread %d: %llu/%llu keys (%.1f%%) at %.1f keys/sec%s", 
-                           thread_number, total_keys_generated, thread_max_keys, 
-                           percent_complete, keys_per_sec, 
-                           thread_number == 0 ? "                    " : "");
-                    fflush(stdout);
-                }
-            }
-        }
-        
-        // Check if should continue or if requested number is reached
-        if (total_keys_written >= max_pubkeys_to_generate) {
-            break;
-        }
-        
-        // Increment step counter for stats
-        steps[thread_number]++;
-    }
-    
-    // Final stats for this thread
-    time_t end_time = time(NULL);
-    double total_time = difftime(end_time, start_time);
-    if (total_time > 0 && !FLAGQUIET) {
-        printf("\n[+] Thread %d completed: %llu keys in %.1f seconds (%.1f keys/sec)\n", 
-               thread_number, total_keys_generated, total_time, 
-               total_keys_generated / total_time);
-    }
-    
-    // ADDED: Force flush any remaining keys in thread buffer for this thread
-    for (int i = 0; i < NUM_BUFFERS; i++) {
-        if (i == thread_number && thread_buffers[i].count > 0) {
-            #if defined(_WIN64) && !defined(__CYGWIN__)
-            WaitForSingleObject(thread_buffers[i].mutex, INFINITE);
-            #else
-            pthread_mutex_lock(&thread_buffers[i].mutex);
-            #endif
-            
-            // Set the ready flag to ensure the writer thread processes this buffer
-            thread_buffers[i].ready = true;
-            
-            // Also manually write the keys if this is the last thread to finish
-            if (thread_number == NTHREADS - 1 || total_keys_generated == thread_max_keys) {
-                if (pubkeyfile != NULL) {
-                    #if defined(_WIN64) && !defined(__CYGWIN__)
-                    WaitForSingleObject(write_keys, INFINITE);
-                    #else
-                    pthread_mutex_lock(&write_keys);
-                    #endif
+                if (elapsed_time > 0) {
+                    double keys_per_sec = total_keys_generated / elapsed_time;
+                    double percent_complete = (thread_max_keys > 0) ? 100.0 * total_keys_generated / thread_max_keys : 0.0;
                     
-                    // Write any remaining keys directly
-                    fwrite(thread_buffers[i].keys, 33, thread_buffers[i].count, pubkeyfile);
-                    total_keys_written += thread_buffers[i].count;
-                    thread_buffers[i].count = 0;
-                    
-                    // Force flush to disk
-                    fflush(pubkeyfile);
-                    
-                    printf("\n[+] Thread %d: Flushed remaining keys to disk\n", thread_number);
-                    
-                    #if defined(_WIN64) && !defined(__CYGWIN__)
-                    ReleaseMutex(write_keys);
-                    #else
-                    pthread_mutex_unlock(&write_keys);
-                    #endif
+                    // Only one thread (thread 0) should print to avoid messy output
+                    if (thread_number == 0 || FLAGQUIET == 0) {
+                        printf("\r[+] Thread %d: %llu/%llu keys (%.1f%%) at %.1f keys/sec%s", 
+                               thread_number, total_keys_generated, thread_max_keys, 
+                               percent_complete, keys_per_sec, 
+                               thread_number == 0 ? "                    " : "");
+                        fflush(stdout);
+                    }
                 }
             }
             
-            #if defined(_WIN64) && !defined(__CYGWIN__)
-            ReleaseMutex(thread_buffers[i].mutex);
-            #else
-            pthread_mutex_unlock(&thread_buffers[i].mutex);
-            #endif
+            // Check if should continue or if requested number is reached
+            if (total_keys_written >= max_pubkeys_to_generate) {
+                break;
+            }
+            
+            // Increment step counter for stats
+            steps[thread_number]++;
         }
+        
+        // Final stats for this thread
+        time_t end_time = time(NULL);
+        double total_time = difftime(end_time, start_time);
+        if (total_time > 0 && !FLAGQUIET) {
+            printf("\n[+] Thread %d completed: %llu keys in %.1f seconds (%.1f keys/sec)\n", 
+                   thread_number, total_keys_generated, total_time, 
+                   total_keys_generated / total_time);
+        }
+        
+        ends[thread_number] = 1;
+        delete grp;
+        return NULL;
     }
-    
-    ends[thread_number] = 1;
-    delete grp;
-    return NULL;
-}
 
     // Original thread_process code for non-evenly distributed mode
     do
@@ -6579,6 +7066,179 @@ void *thread_bPload_2blooms(void *vargp)
     return NULL;
 }
 
+#if defined(_WIN64) && !defined(__CYGWIN__)
+DWORD WINAPI thread_subtract_bloom_load(LPVOID vargp)
+{
+#else
+void *thread_subtract_bloom_load(void *vargp)
+{
+#endif
+    struct subtractBPload *tt = (struct subtractBPload *)vargp;
+    uint64_t i_counter;
+    int threadid = tt->threadid;
+    
+    // Use CPU_GRP_SIZE for batch processing
+    IntGroup *grp = new IntGroup(CPU_GRP_SIZE / 2 + 1);
+    Point startP;
+    Int dx[CPU_GRP_SIZE / 2 + 1];
+    Point pts[CPU_GRP_SIZE];
+    Int dy, dyn, _s, _p;
+    Point pp, pn;
+    
+    int i, hLength = (CPU_GRP_SIZE / 2 - 1);
+    
+    // Calculate starting subtract value for this thread
+    Int currentSubtract;
+    currentSubtract.SetInt64(tt->from);
+    currentSubtract.Mult(&subtract_bloom_spacing);
+    
+    // Starting point for subtraction
+    Int km;
+    km.SetInt64(tt->from + 1);
+    km.Mult(&subtract_bloom_spacing);
+    km.Add((uint64_t)(CPU_GRP_SIZE / 2));
+    
+    // Compute the subtract public key
+    Point subtractBase = secp->ComputePublicKey(&km);
+    
+    // Negate for subtraction
+    Point negatedSubtractBase = secp->Negation(subtractBase);
+    
+    // Calculate the starting point: origin - subtractBase
+    startP = secp->AddDirect(subtract_bloom_origin, negatedSubtractBase);
+    
+    grp->Set(dx);
+    
+    uint64_t nbStep = (tt->to - tt->from) / CPU_GRP_SIZE;
+    if (((tt->to - tt->from) % CPU_GRP_SIZE) != 0) {
+        nbStep++;
+    }
+    
+    i_counter = tt->from;
+    
+    // Generate stride points for batch processing
+    Point strideG = secp->ComputePublicKey(&subtract_bloom_spacing);
+    Point strideGn[CPU_GRP_SIZE/2];
+    Point stridePt = strideG;
+    
+    strideGn[0] = stridePt;
+    for (int j = 1; j < CPU_GRP_SIZE/2; j++) {
+        stridePt = secp->AddDirect(stridePt, strideG);
+        strideGn[j] = stridePt;
+    }
+    Point stride2Gn = secp->DoubleDirect(strideGn[CPU_GRP_SIZE/2 - 1]);
+    
+    for (uint64_t s = 0; s < nbStep; s++) {
+        // Calculate dx values
+        for (i = 0; i < hLength; i++) {
+            dx[i].ModSub(&strideGn[i].x, &startP.x);
+        }
+        dx[i].ModSub(&strideGn[i].x, &startP.x);
+        dx[i + 1].ModSub(&stride2Gn.x, &startP.x);
+        
+        // Grouped ModInv - this is much faster than individual inversions
+        grp->ModInv();
+        
+        pts[CPU_GRP_SIZE / 2] = startP;
+        
+        // Generate points in both directions from center
+        for (i = 0; i < hLength; i++) {
+            pp = startP;
+            pn = startP;
+            
+            // P = startP + i*strideG
+            dy.ModSub(&strideGn[i].y, &pp.y);
+            _s.ModMulK1(&dy, &dx[i]);
+            _p.ModSquareK1(&_s);
+            
+            pp.x.ModNeg();
+            pp.x.ModAdd(&_p);
+            pp.x.ModSub(&strideGn[i].x);
+            
+            // P = startP - i*strideG
+            dyn.Set(&strideGn[i].y);
+            dyn.ModNeg();
+            dyn.ModSub(&pn.y);
+            
+            _s.ModMulK1(&dyn, &dx[i]);
+            _p.ModSquareK1(&_s);
+            
+            pn.x.ModNeg();
+            pn.x.ModAdd(&_p);
+            pn.x.ModSub(&strideGn[i].x);
+            
+            pts[CPU_GRP_SIZE / 2 + (i + 1)] = pp;
+            pts[CPU_GRP_SIZE / 2 - (i + 1)] = pn;
+        }
+        
+        // First point (startP - (CPU_GRP_SIZE/2)*strideG)
+        pn = startP;
+        dyn.Set(&strideGn[i].y);
+        dyn.ModNeg();
+        dyn.ModSub(&pn.y);
+        
+        _s.ModMulK1(&dyn, &dx[i]);
+        _p.ModSquareK1(&_s);
+        
+        pn.x.ModNeg();
+        pn.x.ModAdd(&_p);
+        pn.x.ModSub(&strideGn[i].x);
+        
+        pts[0] = pn;
+        
+        // Add all points to bloom filter
+        for (int j = 0; j < CPU_GRP_SIZE && i_counter < tt->to; j++) {
+            unsigned char xcoord[32];
+            pts[j].x.Get32Bytes(xcoord);
+            
+            // Use first 20 bytes as index for mutex (similar to BSGS)
+            uint8_t mutex_index = xcoord[0];
+            
+#if defined(_WIN64) && !defined(__CYGWIN__)
+            WaitForSingleObject(subtract_bloom_mutex[mutex_index], INFINITE);
+            bloom_add(&bloom, xcoord, MAXLENGTHADDRESS);
+            ReleaseMutex(subtract_bloom_mutex[mutex_index]);
+#else
+            pthread_mutex_lock(&subtract_bloom_mutex[mutex_index]);
+            bloom_add(&bloom, xcoord, MAXLENGTHADDRESS);
+            pthread_mutex_unlock(&subtract_bloom_mutex[mutex_index]);
+#endif
+            
+            i_counter++;
+        }
+        
+        // Next start point
+        pp = startP;
+        dy.ModSub(&stride2Gn.y, &pp.y);
+        
+        _s.ModMulK1(&dy, &dx[i + 1]);
+        _p.ModSquareK1(&_s);
+        
+        pp.x.ModNeg();
+        pp.x.ModAdd(&_p);
+        pp.x.ModSub(&stride2Gn.x);
+        
+        pp.y.ModSub(&stride2Gn.x, &pp.x);
+        pp.y.ModMulK1(&_s);
+        pp.y.ModSub(&stride2Gn.y);
+        startP = pp;
+    }
+    
+    delete grp;
+    
+#if defined(_WIN64) && !defined(__CYGWIN__)
+    WaitForSingleObject(bPload_mutex[threadid], INFINITE);
+    tt->finished = 1;
+    ReleaseMutex(bPload_mutex[threadid]);
+#else
+    pthread_mutex_lock(&bPload_mutex[threadid]);
+    tt->finished = 1;
+    pthread_mutex_unlock(&bPload_mutex[threadid]);
+#endif
+    
+    return NULL;
+}
+
 /* This function perform the KECCAK Opetation*/
 void KECCAK_256(uint8_t *source, size_t size, uint8_t *dst)
 {
@@ -8387,8 +9047,13 @@ bool readFileVanity(char *fileName)
 
 bool readFileAddress(char *fileName)
 {
+    // Check if we're in subtract bloom mode
+    if (FLAGSUBTRACTBLOOM) {
+        return loadSubtractedKeysToBloom();
+    }
+    
     FILE *fileDescriptor;
-    char fileBloomName[30]; /* Actually it is Bloom and Table but just to keep the variable name short*/
+    char fileBloomName[30];
     uint8_t checksum[32], hexPrefix[9];
     char dataChecksum[32], bloomChecksum[32];
     size_t bytesRead;
@@ -8749,118 +9414,217 @@ bool forceReadFileAddressEth(char *fileName)
 
 bool forceReadFileXPoint(char *fileName)
 {
-    /* Here we read the original file as usual */
     FILE *fileDescriptor;
-    uint64_t numberItems, i;
+    uint64_t numberItems = 0, i = 0;
     size_t r, lenaux;
     uint8_t rawvalue[100];
     char aux[1000], *hextemp;
-    Tokenizer tokenizer_xpoint; // tokenizer
-    fileDescriptor = fopen(fileName, "r");
+    Tokenizer tokenizer_xpoint;
+    
+    // Open file in binary mode to detect format
+    fileDescriptor = fopen(fileName, "rb");
     if (fileDescriptor == NULL)
     {
         fprintf(stderr, "[E] Error opening the file %s, line %i\n", fileName, __LINE__ - 2);
         return false;
     }
-    /*Count lines in the file*/
-    numberItems = 0;
-    while (!feof(fileDescriptor))
-    {
-        hextemp = fgets(aux, 1000, fileDescriptor);
-        trim(aux, " \t\n\r");
-        if (hextemp == aux)
-        {
-            r = strlen(aux);
-            if (r >= 40)
-            {
-                numberItems++;
-            }
+    
+    // Detect if file is binary or text
+    bool is_binary = false;
+    unsigned char detect_buf[4];
+    size_t bytes_read = fread(detect_buf, 1, 4, fileDescriptor);
+    
+    if (bytes_read >= 1) {
+        if (detect_buf[0] == 0x02 || detect_buf[0] == 0x03 || detect_buf[0] == 0x04) {
+            is_binary = true;
         }
     }
+    
+    // Get file size
+    fseek(fileDescriptor, 0, SEEK_END);
+    long file_size = ftell(fileDescriptor);
     fseek(fileDescriptor, 0, SEEK_SET);
-
-    MAXLENGTHADDRESS = 20; /*20 bytes beacuase we only need the data in binary*/
-
-    printf("[+] Allocating memory for %" PRIu64 " elements: %.2f MB\n", numberItems, (double)(((double)sizeof(struct address_value) * numberItems) / (double)1048576));
-    addressTable = (struct address_value *)malloc(sizeof(struct address_value) * numberItems);
-    checkpointer((void *)addressTable, __FILE__, "malloc", "addressTable", __LINE__ - 1);
-
-    N = numberItems;
-
-    if (!initBloomFilter(&bloom, N))
-        return false;
-
-    i = 0;
-    while (i < N)
-    {
-        memset(aux, 0, 1000);
-        hextemp = fgets(aux, 1000, fileDescriptor);
-        memset((void *)&addressTable[i], 0, sizeof(struct address_value));
-        if (hextemp == aux)
+    
+    // Count items based on file type
+    if (is_binary) {
+        int key_size = (detect_buf[0] == 0x04) ? 65 : 33;
+        numberItems = file_size / key_size;
+        
+        printf("[+] Detected binary file format (%s keys)\n", 
+               key_size == 33 ? "compressed" : "uncompressed");
+    } else {
+        // Text file - count valid lines
+        fclose(fileDescriptor);
+        fileDescriptor = fopen(fileName, "r");
+        
+        while (!feof(fileDescriptor))
         {
-            trim(aux, " \t\n\r");
-            stringtokenizer(aux, &tokenizer_xpoint);
-            hextemp = nextToken(&tokenizer_xpoint);
-            lenaux = strlen(hextemp);
-            if (isValidHex(hextemp))
+            if (fgets(aux, 1000, fileDescriptor) != NULL)
             {
-                switch (lenaux)
+                char *comment = strchr(aux, '#');
+                if (comment) *comment = '\0';
+                
+                trim(aux, " \t\n\r");
+                r = strlen(aux);
+                if (r >= 64)
                 {
-                case 64: /*X value*/
-                    r = hexs2bin(aux, (uint8_t *)rawvalue);
-                    if (r)
-                    {
-                        memcpy(addressTable[i].value, rawvalue, 20);
-                        bloom_add(&bloom, rawvalue, MAXLENGTHADDRESS);
-                    }
-                    else
-                    {
-                        fprintf(stderr, "[E] error hexs2bin\n");
-                    }
-                    break;
-                case 66: /*Compress publickey*/
-                    r = hexs2bin(aux + 2, (uint8_t *)rawvalue);
-                    if (r)
-                    {
-                        memcpy(addressTable[i].value, rawvalue, 20);
-                        bloom_add(&bloom, rawvalue, MAXLENGTHADDRESS);
-                    }
-                    else
-                    {
-                        fprintf(stderr, "[E] error hexs2bin\n");
-                    }
-                    break;
-                case 130: /* Uncompress publickey length*/
-                    r = hexs2bin(aux, (uint8_t *)rawvalue);
-                    if (r)
-                    {
-                        memcpy(addressTable[i].value, rawvalue + 2, 20);
-                        bloom_add(&bloom, rawvalue, MAXLENGTHADDRESS);
-                    }
-                    else
-                    {
-                        fprintf(stderr, "[E] error hexs2bin\n");
-                    }
-                    break;
-                default:
-                    fprintf(stderr, "[E] Omiting line unknow length size %li: %s\n", lenaux, aux);
-                    break;
+                    numberItems++;
                 }
             }
-            else
-            {
-                fprintf(stderr, "[E] Ignoring invalid hexvalue %s\n", aux);
-            }
-            freetokenizer(&tokenizer_xpoint);
         }
-        else
-        {
-            fprintf(stderr, "[E] Omiting line : %s\n", aux);
-            N--;
-        }
-        i++;
+        fseek(fileDescriptor, 0, SEEK_SET);
+        printf("[+] Detected text file format\n");
     }
+    
+    if (numberItems == 0) {
+        fprintf(stderr, "[E] No valid keys found in file\n");
+        fclose(fileDescriptor);
+        return false;
+    }
+    
+    MAXLENGTHADDRESS = 20;
+    N = numberItems;
+    
+    printf("[+] Total keys to process: %" PRIu64 "\n", numberItems);
+    
+    // For large datasets, only allocate minimal addressTable
+    // We'll rely primarily on the bloom filter
+    if (numberItems > 10000000) {  // More than 10M keys
+        printf("[+] Large dataset detected. Using bloom-filter-only mode.\n");
+        printf("[+] Note: There may be occasional false positives.\n");
+        
+        // Allocate just a dummy addressTable to keep the code structure intact
+        addressTable = (struct address_value *)malloc(sizeof(struct address_value) * 1);
+        N = 0;  // Set to 0 so binary search always fails, forcing bloom-only mode
+    } else {
+        // Original behavior for smaller files
+        printf("[+] Allocating memory for %" PRIu64 " elements: %.2f MB\n", 
+               numberItems, (double)(((double)sizeof(struct address_value) * numberItems) / (double)1048576));
+        
+        addressTable = (struct address_value *)malloc(sizeof(struct address_value) * numberItems);
+        if (addressTable == NULL) {
+            fprintf(stderr, "[E] Failed to allocate memory.\n");
+            fclose(fileDescriptor);
+            return false;
+        }
+    }
+    
+    checkpointer((void *)addressTable, __FILE__, "malloc", "addressTable", __LINE__ - 1);
+    
+    // Initialize bloom filter with the full dataset size
+    printf("[+] Initializing bloom filter for %" PRIu64 " elements\n", numberItems);
+    if (!initBloomFilter(&bloom, numberItems))
+        return false;
+    
+    i = 0;
+    
+    if (is_binary) {
+        // Binary file processing
+        unsigned char entry[65];
+        int key_size = (detect_buf[0] == 0x04) ? 65 : 33;
+        
+        // Reopen in binary mode
+        fclose(fileDescriptor);
+        fileDescriptor = fopen(fileName, "rb");
+        
+        uint64_t keys_processed = 0;
+        while (fread(entry, key_size, 1, fileDescriptor) == 1)
+        {
+            // For bloom filter, we only need to add the X coordinate
+            bloom_add(&bloom, entry + 1, MAXLENGTHADDRESS);
+            
+            // Only store in addressTable if using small dataset mode
+            if (N > 0 && i < N) {
+                memset((void *)&addressTable[i], 0, sizeof(struct address_value));
+                memcpy(addressTable[i].value, entry + 1, 20);
+                i++;
+            }
+            
+            keys_processed++;
+            
+            // Progress indicator
+            if (keys_processed % 1000000 == 0) {
+                printf("\r[+] Processed %lu/%lu keys (%.1f%%)", 
+                       keys_processed, numberItems, (float)keys_processed * 100 / numberItems);
+                fflush(stdout);
+            }
+        }
+        printf("\r[+] Processed %lu/%lu keys (100.0%%)\n", keys_processed, numberItems);
+    } else {
+        // Text file processing
+        uint64_t keys_processed = 0;
+        while (!feof(fileDescriptor))
+        {
+            memset(aux, 0, 1000);
+            if (fgets(aux, 1000, fileDescriptor) != NULL)
+            {
+                char *comment = strchr(aux, '#');
+                if (comment) *comment = '\0';
+                
+                trim(aux, " \t\n\r");
+                
+                if (strlen(aux) >= 64)
+                {
+                    const char* hex_start = aux;
+                    
+                    if (strlen(aux) >= 2 && aux[0] == '0' && aux[1] == 'x') {
+                        hex_start = aux + 2;
+                    }
+                    
+                    lenaux = strlen(hex_start);
+                    
+                    if (isValidHex((char*)hex_start))
+                    {
+                        bool valid = false;
+                        switch (lenaux)
+                        {
+                        case 64: // X coordinate only
+                            r = hexs2bin((char*)hex_start, (uint8_t *)rawvalue);
+                            if (r) valid = true;
+                            break;
+                            
+                        case 66: // Compressed public key
+                            r = hexs2bin((char*)hex_start + 2, (uint8_t *)rawvalue);
+                            if (r) valid = true;
+                            break;
+                            
+                        case 130: // Uncompressed public key
+                            r = hexs2bin((char*)hex_start + 2, (uint8_t *)rawvalue);
+                            if (r) valid = true;
+                            break;
+                        }
+                        
+                        if (valid) {
+                            bloom_add(&bloom, rawvalue, MAXLENGTHADDRESS);
+                            
+                            // Only store in addressTable if using small dataset mode
+                            if (N > 0 && i < N) {
+                                memset((void *)&addressTable[i], 0, sizeof(struct address_value));
+                                memcpy(addressTable[i].value, rawvalue, 20);
+                                i++;
+                            }
+                            
+                            keys_processed++;
+                        }
+                    }
+                }
+            }
+            
+            if (keys_processed % 100000 == 0 && keys_processed > 0) {
+                printf("\r[+] Processed %lu keys", keys_processed);
+                fflush(stdout);
+            }
+        }
+        if (keys_processed % 100000 != 0) {
+            printf("\r[+] Processed %lu keys\n", keys_processed);
+        }
+    }
+    
     fclose(fileDescriptor);
+    
+    printf("[+] Bloom filter initialized with %lu keys\n", numberItems);
+    printf("[+] Bloom filter size: %.2f MB\n", (float)bloom.bytes / (1024.0 * 1024.0));
+    
     return true;
 }
 
@@ -9461,3 +10225,4 @@ void calcualteindex(int i, Int *key)
         key->Add(&BSGS_M3);
     }
 }
+
