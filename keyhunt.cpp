@@ -100,18 +100,6 @@ volatile bool writer_running = true;
 uint64_t total_keys_written = 0;
 
 
-#if defined(_WIN64) && !defined(__CYGWIN__)
-HANDLE writer_thread;
-HANDLE buffer_ready_event;
-HANDLE *subtract_bloom_mutex = NULL;
-#else
-pthread_t writer_thread;
-pthread_cond_t buffer_ready_cond;
-pthread_mutex_t buffer_ready_mutex;
-pthread_mutex_t *subtract_bloom_mutex = NULL;
-#endif
-
-
 struct bsgs_xvalue
 {
     uint8_t value[6];
@@ -1326,8 +1314,64 @@ if (FLAGMODE == MODE_SUBTRACT && FLAGRANDOMMULTIPLE) {
 }
 
     if (FLAGMODE == MODE_BSGS)
-    {
-        printf("[+] Opening file %s\n", fileName);
+{
+    printf("[+] Opening file %s\n", fileName);
+    
+    // Check if it's subtract mode
+    if (strncmp(fileName, "subtract", 8) == 0) {
+        // Subtract mode for BSGS
+        if (targetSubtractKeyStrs.empty()) {
+            fprintf(stderr, "[E] Subtract mode requires -P parameter with origin public key\n");
+            exit(EXIT_FAILURE);
+        }
+        
+        // Parse subtract parameters using existing function
+        if (!generateSubtractedKeysToBloom(fileName, targetSubtractKeyStrs[0].c_str())) {
+            fprintf(stderr, "[E] Failed to parse subtract parameters\n");
+            exit(EXIT_FAILURE);
+        }
+        
+        // Generate subtracted points as BSGS targets
+        printf("[+] Generating %llu subtracted points as BSGS targets\n", subtract_bloom_count);
+        
+        N = subtract_bloom_count;
+        bsgs_point_number = subtract_bloom_count;
+        
+        // Allocate BSGS arrays
+        bsgs_found = (int *)calloc(N, sizeof(int));
+        checkpointer((void *)bsgs_found, __FILE__, "calloc", "bsgs_found", __LINE__ - 1);
+        OriginalPointsBSGS.reserve(N);
+        OriginalPointsBSGScompressed = (bool *)malloc(N * sizeof(bool));
+        checkpointer((void *)OriginalPointsBSGScompressed, __FILE__, "malloc", "OriginalPointsBSGScompressed", __LINE__ - 1);
+        
+        // Generate each subtracted point
+        Int currentSubtract;
+        for (uint64_t i = 0; i < N; i++) {
+            // Calculate subtract value: i * spacing
+            currentSubtract.SetInt64(i);
+            currentSubtract.Mult(&subtract_bloom_spacing);
+            
+            // Compute the public key for this subtract value
+            Point subtractPubKey = secp->ComputePublicKey(&currentSubtract);
+            
+            // Negate for subtraction
+            Point negatedSubtractPubKey = secp->Negation(subtractPubKey);
+            
+            // Calculate result: origin - (i * spacing)
+            OriginalPointsBSGS[i] = secp->AddDirect(subtract_bloom_origin, negatedSubtractPubKey);
+            OriginalPointsBSGScompressed[i] = true; // Assume compressed
+            
+            // Progress indicator
+            if (i % 100000 == 0 && i > 0) {
+                printf("\r[+] Generated %llu/%llu target points", i, N);
+                fflush(stdout);
+            }
+        }
+        printf("\r[+] Generated %llu target points for BSGS search\n", N);
+        printf("[+] Added %u points from subtract mode\n", bsgs_point_number);
+        
+    } else {
+        // Original file reading code
         fd = fopen(fileName, "rb");
         if (fd == NULL)
         {
@@ -1384,7 +1428,6 @@ if (FLAGMODE == MODE_SUBTRACT && FLAGRANDOMMULTIPLE) {
                     switch (strlen(aux2))
                     {
                     case 66:
-
                         if (secp->ParsePublicKeyHex(aux2, OriginalPointsBSGS[i], OriginalPointsBSGScompressed[i]))
                         {
                             i++;
@@ -1393,10 +1436,8 @@ if (FLAGMODE == MODE_SUBTRACT && FLAGRANDOMMULTIPLE) {
                         {
                             N--;
                         }
-
                         break;
                     case 130:
-
                         if (secp->ParsePublicKeyHex(aux2, OriginalPointsBSGS[i], OriginalPointsBSGScompressed[i]))
                         {
                             i++;
@@ -1405,7 +1446,6 @@ if (FLAGMODE == MODE_SUBTRACT && FLAGRANDOMMULTIPLE) {
                         {
                             N--;
                         }
-
                         break;
                     default:
                         printf("Invalid length: %s\n", aux2);
@@ -1427,6 +1467,7 @@ if (FLAGMODE == MODE_SUBTRACT && FLAGRANDOMMULTIPLE) {
             fprintf(stderr, "[E] The file don't have any valid publickeys\n");
             exit(EXIT_FAILURE);
         }
+    }
         BSGS_N.SetInt32(0);
         BSGS_M.SetInt32(0);
 
