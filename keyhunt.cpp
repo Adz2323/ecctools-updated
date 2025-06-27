@@ -3093,18 +3093,16 @@ bool loadSubtractedKeysToBloom() {
     
     printf("\n[+] Proceeding with key generation using %d threads...\n", NTHREADS);
     
-    // Initialize bloom filter for the number of keys
-    N = subtract_bloom_count;
-    MAXLENGTHADDRESS = 20;
+    // For xpoint mode, we need 32 bytes for X coordinate
+    MAXLENGTHADDRESS = 32;
     
-    // For large datasets, minimal addressTable
-    if (subtract_bloom_count > 10000000) {
-        printf("[+] Large dataset mode - using bloom filter only\n");
-        addressTable = (struct address_value *)malloc(sizeof(struct address_value) * 1);
-        N = 0;
-    } else {
-        addressTable = (struct address_value *)malloc(sizeof(struct address_value) * subtract_bloom_count);
-    }
+    // For subtract bloom mode, always use bloom-filter-only mode
+    printf("[+] Subtract bloom mode - using bloom filter only (no addressTable)\n");
+    printf("[+] Note: There may be occasional false positives.\n");
+    
+    // Allocate minimal addressTable (just to keep code structure intact)
+    addressTable = (struct address_value *)malloc(sizeof(struct address_value) * 1);
+    N = 0;  // Set to 0 so binary search is skipped, forcing bloom-only mode
     
     if (!addressTable) {
         fprintf(stderr, "[E] Failed to allocate memory\n");
@@ -3138,8 +3136,11 @@ bool loadSubtractedKeysToBloom() {
     }
 #endif
     
-    // Prepare thread workload
     uint64_t WORKLOAD = 1048576; // 1M keys per batch
+    // If total keys is less than workload, adjust workload
+    if (subtract_bloom_count < WORKLOAD) {
+        WORKLOAD = subtract_bloom_count;
+    }
     uint64_t THREADCYCLES = subtract_bloom_count / WORKLOAD;
     uint64_t PERTHREAD_R = subtract_bloom_count % WORKLOAD;
     if (PERTHREAD_R != 0) {
@@ -3180,8 +3181,10 @@ bool loadSubtractedKeysToBloom() {
                     bPload_temp_ptr[j].to = BASE + WORKLOAD;
                     bPload_temp_ptr[j].workload = WORKLOAD;
                 } else {
-                    bPload_temp_ptr[j].to = BASE + WORKLOAD + PERTHREAD_R;
-                    bPload_temp_ptr[j].workload = WORKLOAD + PERTHREAD_R;
+                    // For the last thread, only assign remaining keys
+                    uint64_t remaining = subtract_bloom_count - BASE;
+                    bPload_temp_ptr[j].to = BASE + remaining;
+                    bPload_temp_ptr[j].workload = remaining;
                     salir = 1;
                 }
                 
@@ -5143,74 +5146,116 @@ void *thread_process(void *vargp)
                         }
                         break;
                     case MODE_XPOINT:
-                        for (k = 0; k < 4; k++)
-                        {
-                            if (FLAGENDOMORPHISM)
-                            {
-                                pts[(4 * j) + k].x.Get32Bytes((unsigned char *)rawvalue);
-                                r = bloom_check(&bloom, rawvalue, MAXLENGTHADDRESS);
-                                if (r)
-                                {
-                                    r = searchbinary(addressTable, rawvalue, N);
-                                    if (r)
-                                    {
-                                        keyfound.SetInt32(k);
-                                        keyfound.Mult(&stride);
-                                        keyfound.Add(&key_mpz);
+    for (k = 0; k < 4; k++)
+    {
+        if (FLAGENDOMORPHISM)
+        {
+            pts[(4 * j) + k].x.Get32Bytes((unsigned char *)rawvalue);
+            r = bloom_check(&bloom, rawvalue, 32);
+            if (r)
+            {
+                // For bloom-only mode (N == 0), skip binary search
+                if (N == 0) {
+                    // Bloom filter match in bloom-only mode
+                    if (FLAGDEBUG) {
+                        printf("\n[D] Bloom filter match (bloom-only mode) for X coordinate\n");
+                    }
+                    keyfound.SetInt32(k);
+                    keyfound.Mult(&stride);
+                    keyfound.Add(&key_mpz);
+                    writekey(false, &keyfound);
+                } else {
+                    // Normal mode with addressTable
+                    r = searchbinary(addressTable, rawvalue, N);
+                    if (r)
+                    {
+                        keyfound.SetInt32(k);
+                        keyfound.Mult(&stride);
+                        keyfound.Add(&key_mpz);
+                        writekey(false, &keyfound);
+                    }
+                }
+            }
+            
+            endomorphism_beta[(j * 4) + k].x.Get32Bytes((unsigned char *)rawvalue);
+            r = bloom_check(&bloom, rawvalue, 32);
+            if (r)
+            {
+                // For bloom-only mode (N == 0), skip binary search
+                if (N == 0) {
+                    keyfound.SetInt32(k);
+                    keyfound.Mult(&stride);
+                    keyfound.Add(&key_mpz);
+                    keyfound.ModMulK1order(&lambda);
+                    writekey(false, &keyfound);
+                } else {
+                    r = searchbinary(addressTable, rawvalue, N);
+                    if (r)
+                    {
+                        keyfound.SetInt32(k);
+                        keyfound.Mult(&stride);
+                        keyfound.Add(&key_mpz);
+                        keyfound.ModMulK1order(&lambda);
+                        writekey(false, &keyfound);
+                    }
+                }
+            }
 
-                                        writekey(false, &keyfound);
-                                    }
-                                }
-                                endomorphism_beta[(j * 4) + k].x.Get32Bytes((unsigned char *)rawvalue);
-                                r = bloom_check(&bloom, rawvalue, MAXLENGTHADDRESS);
-                                if (r)
-                                {
-                                    r = searchbinary(addressTable, rawvalue, N);
-                                    if (r)
-                                    {
-                                        keyfound.SetInt32(k);
-                                        keyfound.Mult(&stride);
-                                        keyfound.Add(&key_mpz);
-                                        keyfound.ModMulK1order(&lambda);
-
-                                        writekey(false, &keyfound);
-                                    }
-                                }
-
-                                endomorphism_beta2[(j * 4) + k].x.Get32Bytes((unsigned char *)rawvalue);
-                                r = bloom_check(&bloom, rawvalue, MAXLENGTHADDRESS);
-                                if (r)
-                                {
-                                    r = searchbinary(addressTable, rawvalue, N);
-                                    if (r)
-                                    {
-                                        keyfound.SetInt32(k);
-                                        keyfound.Mult(&stride);
-                                        keyfound.Add(&key_mpz);
-                                        keyfound.ModMulK1order(&lambda2);
-                                        writekey(false, &keyfound);
-                                    }
-                                }
-                            }
-                            else
-                            {
-                                pts[(4 * j) + k].x.Get32Bytes((unsigned char *)rawvalue);
-                                r = bloom_check(&bloom, rawvalue, MAXLENGTHADDRESS);
-                                if (r)
-                                {
-                                    r = searchbinary(addressTable, rawvalue, N);
-                                    if (r)
-                                    {
-                                        keyfound.SetInt32(k);
-                                        keyfound.Mult(&stride);
-                                        keyfound.Add(&key_mpz);
-
-                                        writekey(false, &keyfound);
-                                    }
-                                }
-                            }
-                        }
-                        break;
+            endomorphism_beta2[(j * 4) + k].x.Get32Bytes((unsigned char *)rawvalue);
+            r = bloom_check(&bloom, rawvalue, 32);
+            if (r)
+            {
+                // For bloom-only mode (N == 0), skip binary search
+                if (N == 0) {
+                    keyfound.SetInt32(k);
+                    keyfound.Mult(&stride);
+                    keyfound.Add(&key_mpz);
+                    keyfound.ModMulK1order(&lambda2);
+                    writekey(false, &keyfound);
+                } else {
+                    r = searchbinary(addressTable, rawvalue, N);
+                    if (r)
+                    {
+                        keyfound.SetInt32(k);
+                        keyfound.Mult(&stride);
+                        keyfound.Add(&key_mpz);
+                        keyfound.ModMulK1order(&lambda2);
+                        writekey(false, &keyfound);
+                    }
+                }
+            }
+        }
+        else
+        {
+            pts[(4 * j) + k].x.Get32Bytes((unsigned char *)rawvalue);
+            r = bloom_check(&bloom, rawvalue, 32);
+            if (r)
+            {
+                // For bloom-only mode (N == 0), skip binary search
+                if (N == 0) {
+                    // Bloom filter match in bloom-only mode
+                    if (FLAGDEBUG) {
+                        printf("\n[D] Bloom filter match (bloom-only mode) for X coordinate\n");
+                    }
+                    keyfound.SetInt32(k);
+                    keyfound.Mult(&stride);
+                    keyfound.Add(&key_mpz);
+                    writekey(false, &keyfound);
+                } else {
+                    // Normal mode with addressTable
+                    r = searchbinary(addressTable, rawvalue, N);
+                    if (r)
+                    {
+                        keyfound.SetInt32(k);
+                        keyfound.Mult(&stride);
+                        keyfound.Add(&key_mpz);
+                        writekey(false, &keyfound);
+                    }
+                }
+            }
+        }
+    }
+    break;
                     }
                     count += 4;
                     temp_stride.SetInt32(4);
@@ -7115,157 +7160,54 @@ void *thread_subtract_bloom_load(void *vargp)
 {
 #endif
     struct subtractBPload *tt = (struct subtractBPload *)vargp;
-    uint64_t i_counter;
     int threadid = tt->threadid;
     
-    // Use CPU_GRP_SIZE for batch processing
-    IntGroup *grp = new IntGroup(CPU_GRP_SIZE / 2 + 1);
-    Point startP;
-    Int dx[CPU_GRP_SIZE / 2 + 1];
-    Point pts[CPU_GRP_SIZE];
-    Int dy, dyn, _s, _p;
-    Point pp, pn;
+
     
-    int i, hLength = (CPU_GRP_SIZE / 2 - 1);
-    
-    // Calculate starting subtract value for this thread
+    // Simple sequential generation for subtract bloom
     Int currentSubtract;
-    currentSubtract.SetInt64(tt->from);
-    currentSubtract.Mult(&subtract_bloom_spacing);
+    Point subtractPubKey, negatedSubtractPubKey, resultPoint;
+    unsigned char xcoord[32];
     
-    // Starting point for subtraction
-    Int km;
-    km.SetInt64(tt->from + 1);
-    km.Mult(&subtract_bloom_spacing);
-    km.Add((uint64_t)(CPU_GRP_SIZE / 2));
-    
-    // Compute the subtract public key
-    Point subtractBase = secp->ComputePublicKey(&km);
-    
-    // Negate for subtraction
-    Point negatedSubtractBase = secp->Negation(subtractBase);
-    
-    // Calculate the starting point: origin - subtractBase
-    startP = secp->AddDirect(subtract_bloom_origin, negatedSubtractBase);
-    
-    grp->Set(dx);
-    
-    uint64_t nbStep = (tt->to - tt->from) / CPU_GRP_SIZE;
-    if (((tt->to - tt->from) % CPU_GRP_SIZE) != 0) {
-        nbStep++;
-    }
-    
-    i_counter = tt->from;
-    
-    // Generate stride points for batch processing
-    Point strideG = secp->ComputePublicKey(&subtract_bloom_spacing);
-    Point strideGn[CPU_GRP_SIZE/2];
-    Point stridePt = strideG;
-    
-    strideGn[0] = stridePt;
-    for (int j = 1; j < CPU_GRP_SIZE/2; j++) {
-        stridePt = secp->AddDirect(stridePt, strideG);
-        strideGn[j] = stridePt;
-    }
-    Point stride2Gn = secp->DoubleDirect(strideGn[CPU_GRP_SIZE/2 - 1]);
-    
-    for (uint64_t s = 0; s < nbStep; s++) {
-        // Calculate dx values
-        for (i = 0; i < hLength; i++) {
-            dx[i].ModSub(&strideGn[i].x, &startP.x);
+    // Process each key in the assigned range
+    for (uint64_t i = tt->from; i < tt->to; i++) {
+        // Calculate subtract value: i * spacing
+        currentSubtract.SetInt64(i);
+        currentSubtract.Mult(&subtract_bloom_spacing);
+        
+        // Special handling for subtract value 0
+        if (currentSubtract.IsZero()) {
+            // Origin - 0 = Origin
+            resultPoint = subtract_bloom_origin;
+        } else {
+            // Compute the public key for this subtract value
+            subtractPubKey = secp->ComputePublicKey(&currentSubtract);
+            
+            // Negate for subtraction
+            negatedSubtractPubKey = secp->Negation(subtractPubKey);
+            
+            // Calculate result: origin - (i * spacing)
+            resultPoint = secp->AddDirect(subtract_bloom_origin, negatedSubtractPubKey);
         }
-        dx[i].ModSub(&strideGn[i].x, &startP.x);
-        dx[i + 1].ModSub(&stride2Gn.x, &startP.x);
+    
         
-        // Grouped ModInv - this is much faster than individual inversions
-        grp->ModInv();
+        // Get X coordinate
+        resultPoint.x.Get32Bytes(xcoord);
+    
         
-        pts[CPU_GRP_SIZE / 2] = startP;
+        // Use first byte as mutex index
+        uint8_t mutex_index = xcoord[0];
         
-        // Generate points in both directions from center
-        for (i = 0; i < hLength; i++) {
-            pp = startP;
-            pn = startP;
-            
-            // P = startP + i*strideG
-            dy.ModSub(&strideGn[i].y, &pp.y);
-            _s.ModMulK1(&dy, &dx[i]);
-            _p.ModSquareK1(&_s);
-            
-            pp.x.ModNeg();
-            pp.x.ModAdd(&_p);
-            pp.x.ModSub(&strideGn[i].x);
-            
-            // P = startP - i*strideG
-            dyn.Set(&strideGn[i].y);
-            dyn.ModNeg();
-            dyn.ModSub(&pn.y);
-            
-            _s.ModMulK1(&dyn, &dx[i]);
-            _p.ModSquareK1(&_s);
-            
-            pn.x.ModNeg();
-            pn.x.ModAdd(&_p);
-            pn.x.ModSub(&strideGn[i].x);
-            
-            pts[CPU_GRP_SIZE / 2 + (i + 1)] = pp;
-            pts[CPU_GRP_SIZE / 2 - (i + 1)] = pn;
-        }
-        
-        // First point (startP - (CPU_GRP_SIZE/2)*strideG)
-        pn = startP;
-        dyn.Set(&strideGn[i].y);
-        dyn.ModNeg();
-        dyn.ModSub(&pn.y);
-        
-        _s.ModMulK1(&dyn, &dx[i]);
-        _p.ModSquareK1(&_s);
-        
-        pn.x.ModNeg();
-        pn.x.ModAdd(&_p);
-        pn.x.ModSub(&strideGn[i].x);
-        
-        pts[0] = pn;
-        
-        // Add all points to bloom filter
-        for (int j = 0; j < CPU_GRP_SIZE && i_counter < tt->to; j++) {
-            unsigned char xcoord[32];
-            pts[j].x.Get32Bytes(xcoord);
-            
-            // Use first 20 bytes as index for mutex (similar to BSGS)
-            uint8_t mutex_index = xcoord[0];
-            
 #if defined(_WIN64) && !defined(__CYGWIN__)
-            WaitForSingleObject(subtract_bloom_mutex[mutex_index], INFINITE);
-            bloom_add(&bloom, xcoord, MAXLENGTHADDRESS);
-            ReleaseMutex(subtract_bloom_mutex[mutex_index]);
+        WaitForSingleObject(subtract_bloom_mutex[mutex_index], INFINITE);
+        bloom_add(&bloom, xcoord, 32);  // Always use 32 bytes for xpoint mode
+        ReleaseMutex(subtract_bloom_mutex[mutex_index]);
 #else
-            pthread_mutex_lock(&subtract_bloom_mutex[mutex_index]);
-            bloom_add(&bloom, xcoord, MAXLENGTHADDRESS);
-            pthread_mutex_unlock(&subtract_bloom_mutex[mutex_index]);
+        pthread_mutex_lock(&subtract_bloom_mutex[mutex_index]);
+        bloom_add(&bloom, xcoord, 32);  // Always use 32 bytes for xpoint mode
+        pthread_mutex_unlock(&subtract_bloom_mutex[mutex_index]);
 #endif
-            
-            i_counter++;
-        }
-        
-        // Next start point
-        pp = startP;
-        dy.ModSub(&stride2Gn.y, &pp.y);
-        
-        _s.ModMulK1(&dy, &dx[i + 1]);
-        _p.ModSquareK1(&_s);
-        
-        pp.x.ModNeg();
-        pp.x.ModAdd(&_p);
-        pp.x.ModSub(&stride2Gn.x);
-        
-        pp.y.ModSub(&stride2Gn.x, &pp.x);
-        pp.y.ModMulK1(&_s);
-        pp.y.ModSub(&stride2Gn.y);
-        startP = pp;
     }
-    
-    delete grp;
     
 #if defined(_WIN64) && !defined(__CYGWIN__)
     WaitForSingleObject(bPload_mutex[threadid], INFINITE);
@@ -10266,4 +10208,3 @@ void calcualteindex(int i, Int *key)
         key->Add(&BSGS_M3);
     }
 }
-
