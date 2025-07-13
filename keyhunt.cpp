@@ -17,6 +17,7 @@ email: albertobsd@gmail.com
 #include "bloom/bloom.h"
 #include "sha3/sha3.h"
 #include "util.h"
+#include "index/index.h"
 
 #include "secp256k1/SECP256k1.h"
 #include "secp256k1/Point.h"
@@ -372,6 +373,12 @@ uint64_t starting_prime = 2;
 uint64_t global_steps_taken = 0;  // Global step counter for optimized prime mode
 Int global_base_key;              // Base key for the current prime cycle
 
+// Global flags for index bloom mode
+int FLAGINDEXBLOOM = 0;
+uint64_t index_bloom_count = 0;
+Int index_bloom_spacing;
+Point index_bloom_origin;
+extern ExtremeBloomIndex* g_extreme_index;
 
 //Xpoint Bloom Load
 bool FLAGSUBTRACTBLOOM = false;
@@ -591,10 +598,14 @@ int main(int argc, char **argv)
 
     printf("[+] Version %s, developed by AlbertoBSD\n", version);
     
-    while ((c = getopt(argc, argv, "deh6MoqRSEB:b:c:C:E:f:I:k:L:l:m:N:n:p:P:r:s:t:v:V:G:8:z:O:X")) != -1)
+    while ((c = getopt(argc, argv, "deh6MoqRSEB:b:c:C:E:f:I:ik:L:l:m:N:n:p:P:r:s:t:v:V:G:8:z:O:X")) != -1)
 {
     switch (c)
     {
+        case 'i':
+    FLAGINDEXBLOOM = 1;
+    printf("[+] Index Bloom mode enabled\n");
+    break;
          case 'E':
             FLAGEVENLYDISTRIBUTE = 1;
             printf("[+] Evenly distributed pubkey generation mode enabled\n");
@@ -994,16 +1005,39 @@ int main(int argc, char **argv)
         }
     }
 
-    if (FLAGFILE && FLAGMODE == MODE_XPOINT && strncmp(fileName, "subtract", 8) == 0) {
-    // Find the -p parameter from targetSubtractKeyStrs
-    if (targetSubtractKeyStrs.empty()) {
-        fprintf(stderr, "[E] Subtract bloom mode requires -p parameter with origin public key\n");
-        exit(EXIT_FAILURE);
-    }
+if (FLAGFILE && FLAGMODE == MODE_XPOINT) {
+    // Check for index bloom pattern: "<number> <spacing>"
+    char* file_copy = strdup(fileName);
+    char* first_token = strtok(file_copy, " ");
     
-    if (!generateSubtractedKeysToBloom(fileName, targetSubtractKeyStrs[0].c_str())) {
-        fprintf(stderr, "[E] Failed to parse subtract bloom parameters\n");
-        exit(EXIT_FAILURE);
+    if (first_token && isdigit(first_token[0])) {
+        // Index bloom format detected
+        FLAGINDEXBLOOM = 1;
+
+        if (targetSubtractKeyStrs.empty()) {
+            fprintf(stderr, "[E] Index bloom mode requires -P parameter with origin public key\n");
+            free(file_copy);
+            exit(EXIT_FAILURE);
+        }
+
+        if (!initializeExtremeIndex(fileName, targetSubtractKeyStrs[0].c_str())) {
+            fprintf(stderr, "[E] Failed to initialize index bloom\n");
+            free(file_copy);
+            exit(EXIT_FAILURE);
+        }
+
+        FLAGSUBTRACTBLOOM = false;
+        FLAGREADEDFILE1 = 1;  // ✅ Prevent later file read attempt
+        free(file_copy);
+    } else if (strncmp(fileName, "subtract", 8) == 0) {
+        // Legacy subtract mode
+        free(file_copy);
+        if (!generateSubtractedKeysToBloom(fileName, targetSubtractKeyStrs[0].c_str())) {
+            fprintf(stderr, "[E] Failed to parse subtract bloom parameters\n");
+            exit(EXIT_FAILURE);
+        }
+    } else {
+        free(file_copy);
     }
 }
 
@@ -2731,6 +2765,7 @@ case MODE_SUBTRACT:
                     pretotal.Set(&debugcount_mpz);
                     pretotal.Mult(steps[j]);
                     total.Add(&pretotal);
+                    
                 }
 
                 if (FLAGENDOMORPHISM)
@@ -2830,6 +2865,10 @@ case MODE_SUBTRACT:
                 free(str_seconds);
                 free(str_pretotal);
                 free(str_total);
+
+                if (FLAGINDEXBLOOM && g_extreme_index && FLAGMODE == MODE_XPOINT) {
+    g_extreme_index->displayStats(); // Display current statistics
+}
             }
         }
     } while (continue_flag);
@@ -2940,6 +2979,11 @@ case MODE_SUBTRACT:
     if (FLAGMODE == MODE_SUBTRACT && bloom_subtract_initialized) {
         bloom_free(&bloom_subtract);
     }
+
+   if (g_extreme_index) {
+    delete g_extreme_index;
+    g_extreme_index = nullptr;
+}
 
     delete secp;
 
@@ -5146,115 +5190,154 @@ void *thread_process(void *vargp)
                         }
                         break;
                     case MODE_XPOINT:
-    for (k = 0; k < 4; k++)
-    {
-        if (FLAGENDOMORPHISM)
-        {
-            pts[(4 * j) + k].x.Get32Bytes((unsigned char *)rawvalue);
-            r = bloom_check(&bloom, rawvalue, 32);
-            if (r)
-            {
-                // For bloom-only mode (N == 0), skip binary search
-                if (N == 0) {
-                    // Bloom filter match in bloom-only mode
-                    if (FLAGDEBUG) {
-                        printf("\n[D] Bloom filter match (bloom-only mode) for X coordinate\n");
+    if (FLAGINDEXBLOOM && g_extreme_index) {
+        for (k = 0; k < 4; k++) {
+            uint64_t found_index;
+            Int original_offset;
+            if (g_extreme_index->checkKey(pts[(4 * j) + k], found_index, &original_offset)) {
+                // Calculate the actual private key that was checked
+                Int keyfound;
+                keyfound.SetInt32(k);
+                keyfound.Mult(&stride);
+                keyfound.Add(&key_mpz);
+                
+                // Pass the origin point from the extreme index
+                Point origin_point = g_extreme_index->getOriginPoint();
+                
+                // Write the result with the found private key
+                writeExtremeKey(found_index, original_offset, pts[(4 * j) + k], &keyfound, origin_point);
+                
+                // Optional: Display real-time stats
+                if (FLAGQUIET == 0) {
+                    printf("\n[+] Match found! Check KEYFOUNDKEYFOUND.txt for details\n");
+                    g_extreme_index->displayStats();
+                }
+                
+                // Stop all threads if stop_on_first_find is enabled
+                if (g_extreme_index->shouldStop()) {
+                    printf("\n[+] Stopping all threads as requested (stop on first find)\n");
+                    for (int t = 0; t < NTHREADS; t++) {
+                        ends[t] = 1;
                     }
-                    keyfound.SetInt32(k);
-                    keyfound.Mult(&stride);
-                    keyfound.Add(&key_mpz);
-                    writekey(false, &keyfound);
-                } else {
-                    // Normal mode with addressTable
-                    r = searchbinary(addressTable, rawvalue, N);
-                    if (r)
-                    {
+                    continue_flag = 0;
+                    return NULL;
+                }
+            }
+        }
+
+
+    } else {
+        // Original xpoint code (non-index bloom mode)
+        for (k = 0; k < 4; k++)
+        {
+            if (FLAGENDOMORPHISM)
+            {
+                pts[(4 * j) + k].x.Get32Bytes((unsigned char *)rawvalue);
+                r = bloom_check(&bloom, rawvalue, 32);
+                if (r)
+                {
+                    // For bloom-only mode (N == 0), skip binary search
+                    if (N == 0) {
+                        // Bloom filter match in bloom-only mode
+                        if (FLAGDEBUG) {
+                            printf("\n[D] Bloom filter match (bloom-only mode) for X coordinate\n");
+                        }
                         keyfound.SetInt32(k);
                         keyfound.Mult(&stride);
                         keyfound.Add(&key_mpz);
                         writekey(false, &keyfound);
+                    } else {
+                        // Normal mode with addressTable
+                        r = searchbinary(addressTable, rawvalue, N);
+                        if (r)
+                        {
+                            keyfound.SetInt32(k);
+                            keyfound.Mult(&stride);
+                            keyfound.Add(&key_mpz);
+                            writekey(false, &keyfound);
+                        }
                     }
                 }
-            }
-            
-            endomorphism_beta[(j * 4) + k].x.Get32Bytes((unsigned char *)rawvalue);
-            r = bloom_check(&bloom, rawvalue, 32);
-            if (r)
-            {
-                // For bloom-only mode (N == 0), skip binary search
-                if (N == 0) {
-                    keyfound.SetInt32(k);
-                    keyfound.Mult(&stride);
-                    keyfound.Add(&key_mpz);
-                    keyfound.ModMulK1order(&lambda);
-                    writekey(false, &keyfound);
-                } else {
-                    r = searchbinary(addressTable, rawvalue, N);
-                    if (r)
-                    {
+                
+                endomorphism_beta[(j * 4) + k].x.Get32Bytes((unsigned char *)rawvalue);
+                r = bloom_check(&bloom, rawvalue, 32);
+                if (r)
+                {
+                    // For bloom-only mode (N == 0), skip binary search
+                    if (N == 0) {
                         keyfound.SetInt32(k);
                         keyfound.Mult(&stride);
                         keyfound.Add(&key_mpz);
                         keyfound.ModMulK1order(&lambda);
                         writekey(false, &keyfound);
+                    } else {
+                        r = searchbinary(addressTable, rawvalue, N);
+                        if (r)
+                        {
+                            keyfound.SetInt32(k);
+                            keyfound.Mult(&stride);
+                            keyfound.Add(&key_mpz);
+                            keyfound.ModMulK1order(&lambda);
+                            writekey(false, &keyfound);
+                        }
                     }
                 }
-            }
 
-            endomorphism_beta2[(j * 4) + k].x.Get32Bytes((unsigned char *)rawvalue);
-            r = bloom_check(&bloom, rawvalue, 32);
-            if (r)
-            {
-                // For bloom-only mode (N == 0), skip binary search
-                if (N == 0) {
-                    keyfound.SetInt32(k);
-                    keyfound.Mult(&stride);
-                    keyfound.Add(&key_mpz);
-                    keyfound.ModMulK1order(&lambda2);
-                    writekey(false, &keyfound);
-                } else {
-                    r = searchbinary(addressTable, rawvalue, N);
-                    if (r)
-                    {
+                endomorphism_beta2[(j * 4) + k].x.Get32Bytes((unsigned char *)rawvalue);
+                r = bloom_check(&bloom, rawvalue, 32);
+                if (r)
+                {
+                    // For bloom-only mode (N == 0), skip binary search
+                    if (N == 0) {
                         keyfound.SetInt32(k);
                         keyfound.Mult(&stride);
                         keyfound.Add(&key_mpz);
                         keyfound.ModMulK1order(&lambda2);
                         writekey(false, &keyfound);
+                    } else {
+                        r = searchbinary(addressTable, rawvalue, N);
+                        if (r)
+                        {
+                            keyfound.SetInt32(k);
+                            keyfound.Mult(&stride);
+                            keyfound.Add(&key_mpz);
+                            keyfound.ModMulK1order(&lambda2);
+                            writekey(false, &keyfound);
+                        }
                     }
                 }
             }
-        }
-        else
-        {
-            pts[(4 * j) + k].x.Get32Bytes((unsigned char *)rawvalue);
-            r = bloom_check(&bloom, rawvalue, 32);
-            if (r)
+            else
             {
-                // For bloom-only mode (N == 0), skip binary search
-                if (N == 0) {
-                    // Bloom filter match in bloom-only mode
-                    if (FLAGDEBUG) {
-                        printf("\n[D] Bloom filter match (bloom-only mode) for X coordinate\n");
-                    }
-                    keyfound.SetInt32(k);
-                    keyfound.Mult(&stride);
-                    keyfound.Add(&key_mpz);
-                    writekey(false, &keyfound);
-                } else {
-                    // Normal mode with addressTable
-                    r = searchbinary(addressTable, rawvalue, N);
-                    if (r)
-                    {
+                pts[(4 * j) + k].x.Get32Bytes((unsigned char *)rawvalue);
+                r = bloom_check(&bloom, rawvalue, 32);
+                if (r)
+                {
+                    // For bloom-only mode (N == 0), skip binary search
+                    if (N == 0) {
+                        // Bloom filter match in bloom-only mode
+                        if (FLAGDEBUG) {
+                            printf("\n[D] Bloom filter match (bloom-only mode) for X coordinate\n");
+                        }
                         keyfound.SetInt32(k);
                         keyfound.Mult(&stride);
                         keyfound.Add(&key_mpz);
                         writekey(false, &keyfound);
+                    } else {
+                        // Normal mode with addressTable
+                        r = searchbinary(addressTable, rawvalue, N);
+                        if (r)
+                        {
+                            keyfound.SetInt32(k);
+                            keyfound.Mult(&stride);
+                            keyfound.Add(&key_mpz);
+                            writekey(false, &keyfound);
+                        }
                     }
                 }
             }
         }
-    }
+    } 
     break;
                     }
                     count += 4;
