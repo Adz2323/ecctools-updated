@@ -1,11 +1,12 @@
 #include "index.h"
-#include "util.h"
+#include "../util.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <algorithm>
 #include <thread>
 #include <vector>
+#include <math.h>
 
 #ifdef _WIN64
 #include <windows.h>
@@ -13,180 +14,108 @@
 #include <pthread.h>
 #endif
 
-ExtremeBloomIndex* g_extreme_index = nullptr;
+ExtremePatternIndex* g_extreme_pattern_index = nullptr;
 extern Secp256K1* secp;
 extern int NTHREADS;
 
-// MurmurHash3 helper functions
-static inline uint64_t rotl64(uint64_t x, int8_t r) {
-    return (x << r) | (x >> (64 - r));
-}
+Point* g_spacing_point = nullptr;
+Point* g_negated_spacing = nullptr;
 
-static uint64_t fmix64(uint64_t k) {
-    k ^= k >> 33;
-    k *= 0xff51afd7ed558ccdULL;
-    k ^= k >> 33;
-    k *= 0xc4ceb9fe1a85ec53ULL;
-    k ^= k >> 33;
-    return k;
-}
+// Pattern table build thread
+#ifdef _WIN64
+static HANDLE* pattern_mutex = NULL;
+#else
+static pthread_mutex_t* pattern_mutex = NULL;
+#endif
 
-ExtremeBloomIndex::ExtremeBloomIndex() 
-    : layer1(nullptr), layer2(nullptr), layer3(nullptr), 
-      mini_hashes(nullptr), mini_hash_count(0), mini_hash_mutex(nullptr),
-      initialized(false), stop_flag(false) {
+ExtremePatternIndex::ExtremePatternIndex() 
+    : quick_filter(nullptr), use_bloom(false), patternTable(nullptr),
+      table_size(0), step_size(1), initialized(false), stop_flag(false) {
     memset(&stats, 0, sizeof(stats));
-    memset(bloom_mutexes, 0, sizeof(bloom_mutexes));
-    
-    // Set default false positive rates (much lower than before)
-    config.fpp_layer1 = 0.01;   // 1% instead of 25%
-    config.fpp_layer2 = 0.001;  // 0.1% instead of 50%
-    config.fpp_layer3 = 0.0001; // 0.01% instead of 70%
     config.stop_on_first_find = true;
 }
 
-ExtremeBloomIndex::~ExtremeBloomIndex() {
-    if (layer1) { bloom_free(layer1); free(layer1); }
-    if (layer2) { bloom_free(layer2); free(layer2); }
-    if (layer3) { bloom_free(layer3); free(layer3); }
-    if (mini_hashes) free(mini_hashes);
+ExtremePatternIndex::~ExtremePatternIndex() {
+    if (quick_filter) {
+        bloom_free(quick_filter);
+        free(quick_filter);
+        quick_filter = nullptr;
+    }
     
-    // Clean up mutexes
-#ifdef _WIN64
-    if (mini_hash_mutex) CloseHandle((HANDLE)mini_hash_mutex);
-    for (int layer = 0; layer < 3; layer++) {
-        for (int i = 0; i < 256; i++) {
-            if (bloom_mutexes[layer][i]) 
-                CloseHandle((HANDLE)bloom_mutexes[layer][i]);
-        }
+    if (patternTable) {
+        free(patternTable);
+        patternTable = nullptr;
     }
-#else
-    if (mini_hash_mutex) {
-        pthread_mutex_destroy((pthread_mutex_t*)mini_hash_mutex);
-        free(mini_hash_mutex);
+    
+    // Clean up global spacing points
+    if (g_spacing_point) {
+        delete g_spacing_point;
+        g_spacing_point = nullptr;
     }
-    for (int layer = 0; layer < 3; layer++) {
-        for (int i = 0; i < 256; i++) {
-            if (bloom_mutexes[layer][i]) {
-                pthread_mutex_destroy((pthread_mutex_t*)bloom_mutexes[layer][i]);
-                free(bloom_mutexes[layer][i]);
-            }
-        }
+    if (g_negated_spacing) {
+        delete g_negated_spacing;
+        g_negated_spacing = nullptr;
     }
-#endif
 }
 
-void ExtremeBloomIndex::setFalsePositiveRates(double fpp1, double fpp2, double fpp3) {
-    config.fpp_layer1 = fpp1;
-    config.fpp_layer2 = fpp2;
-    config.fpp_layer3 = fpp3;
-}
-
-uint64_t ExtremeBloomIndex::hash1(const uint8_t* data, uint64_t index) {
-    uint64_t h = 0x9e3779b97f4a7c15ULL;
-    h ^= *(uint64_t*)data;
-    h ^= index;
-    return fmix64(h);
-}
-
-uint64_t ExtremeBloomIndex::hash2(const uint8_t* data, uint64_t index) {
-    uint64_t h = 0x517cc1b727220a95ULL;
-    h ^= *(uint64_t*)(data + 8);
-    h ^= rotl64(index, 17);
-    return fmix64(h);
-}
-
-uint64_t ExtremeBloomIndex::hash3(const uint8_t* data, uint64_t index) {
-    uint64_t h = 0x85ebca6b0c1c4e91ULL;
-    h ^= *(uint64_t*)(data + 16);
-    h ^= rotl64(index, 31);
-    return fmix64(h);
-}
-
-uint32_t ExtremeBloomIndex::mini_hash(const uint8_t* data, uint64_t index) {
-    uint32_t h = 0x9e3779b9;
-    h ^= *(uint32_t*)data;
-    h ^= (uint32_t)index;
-    h *= 0x85ebca6b;
-    h ^= h >> 16;
-    return h;
-}
-
-bool ExtremeBloomIndex::initialize(const Point& origin, const Int& spacing, uint64_t num_keys) {
+bool ExtremePatternIndex::initialize(const Point& origin, const Int& spacing, uint64_t num_keys) {
     config.origin_pubkey = origin;
     config.spacing = spacing;
     config.num_keys = num_keys;
-    config.bloom_layers = 3;
     
-    // Initialize bloom filters with better false positive rates
-    layer1 = (struct bloom*)calloc(1, sizeof(struct bloom));
-    if (!layer1) return false;
+    // Calculate optimal step size based on available memory
+    // Target: use at most 100MB for the pattern table
+    const uint64_t max_table_bytes = 100 * 1024 * 1024; // 100MB
+    const uint64_t bytes_per_entry = sizeof(struct pattern_table_entry);
+    uint64_t max_entries = max_table_bytes / bytes_per_entry;
     
-    if (bloom_init2(layer1, num_keys, config.fpp_layer1) != 0) {
-        fprintf(stderr, "[E] Failed to initialize layer 1 bloom\n");
-        return false;
+    if (num_keys <= max_entries) {
+        // We can store every point
+        step_size = 1;
+        table_size = num_keys;
+    } else {
+        // Calculate step size to fit in memory
+        step_size = (num_keys + max_entries - 1) / max_entries;
+        table_size = (num_keys + step_size - 1) / step_size;
     }
     
-    // Layer 2: Expect fewer keys to pass layer 1
-    layer2 = (struct bloom*)calloc(1, sizeof(struct bloom));
-    if (!layer2) return false;
+    // Decide whether to use bloom filter
+    use_bloom = (num_keys > 1000000); // Use bloom for > 1M keys
     
-    uint64_t layer2_size = (uint64_t)(num_keys * config.fpp_layer1);
-    if (layer2_size < 1000) layer2_size = 1000;
-    
-    if (bloom_init2(layer2, layer2_size, config.fpp_layer2) != 0) {
-        fprintf(stderr, "[E] Failed to initialize layer 2 bloom\n");
-        return false;
-    }
-    
-    // Layer 3: Expect even fewer keys
-    layer3 = (struct bloom*)calloc(1, sizeof(struct bloom));
-    if (!layer3) return false;
-    
-    uint64_t layer3_size = (uint64_t)(layer2_size * config.fpp_layer2);
-    if (layer3_size < 1000) layer3_size = 1000;
-    
-    if (bloom_init2(layer3, layer3_size, config.fpp_layer3) != 0) {
-        fprintf(stderr, "[E] Failed to initialize layer 3 bloom\n");
-        return false;
-    }
-    
-    // Mini hashes for final verification
-    mini_hash_count = (uint64_t)(layer3_size * config.fpp_layer3 * 10); // Reserve extra space
-    if (mini_hash_count < 10000) mini_hash_count = 10000;
-    
-    // Don't pre-allocate all mini hashes - we'll collect them during build
-    
-    // Initialize mutexes
-#ifdef _WIN64
-    mini_hash_mutex = CreateMutex(NULL, FALSE, NULL);
-    for (int layer = 0; layer < 3; layer++) {
-        for (int i = 0; i < 256; i++) {
-            bloom_mutexes[layer][i] = CreateMutex(NULL, FALSE, NULL);
+    if (use_bloom) {
+        quick_filter = (struct bloom*)malloc(sizeof(struct bloom));
+        if (!quick_filter) {
+            fprintf(stderr, "[E] Failed to allocate bloom filter\n");
+            return false;
+        }
+        
+        // High false positive rate for minimal memory
+        double fp_rate = 0.9; // 1% false positive rate
+        if (bloom_init2(quick_filter, num_keys, fp_rate) != 0) {
+            fprintf(stderr, "[E] Failed to initialize bloom filter\n");
+            free(quick_filter);
+            quick_filter = nullptr;
+            return false;
         }
     }
-#else
-    mini_hash_mutex = malloc(sizeof(pthread_mutex_t));
-    pthread_mutex_init((pthread_mutex_t*)mini_hash_mutex, NULL);
-    for (int layer = 0; layer < 3; layer++) {
-        for (int i = 0; i < 256; i++) {
-            bloom_mutexes[layer][i] = malloc(sizeof(pthread_mutex_t));
-            pthread_mutex_init((pthread_mutex_t*)bloom_mutexes[layer][i], NULL);
-        }
-    }
-#endif
     
-    printf("[+] Extreme Bloom Index Configuration:\n");
+    // Pre-compute spacing points for faster computation
+    if (!g_spacing_point) {
+        g_spacing_point = new Point();
+        Int spacing_copy(config.spacing);
+        *g_spacing_point = secp->ComputePublicKey(&spacing_copy);
+        g_negated_spacing = new Point(secp->Negation(*g_spacing_point));
+    }
+    
+    printf("[+] Extreme Pattern Index Configuration:\n");
     printf("    Number of keys: %llu\n", num_keys);
-    printf("    Layer 1: %.2f MB (FPP: %.2f%%)\n", 
-           layer1->bytes / (1024.0 * 1024.0), config.fpp_layer1 * 100);
-    printf("    Layer 2: %.2f MB (FPP: %.2f%%)\n", 
-           layer2->bytes / (1024.0 * 1024.0), config.fpp_layer2 * 100);
-    printf("    Layer 3: %.2f MB (FPP: %.2f%%)\n", 
-           layer3->bytes / (1024.0 * 1024.0), config.fpp_layer3 * 100);
+    printf("    Step size: %llu (storing every %llu points)\n", step_size, step_size);
+    printf("    Table entries: %llu\n", table_size);
     
-    uint64_t total = layer1->bytes + layer2->bytes + layer3->bytes;
-    printf("    Total bloom memory: %.2f MB\n", total / (1024.0 * 1024.0));
+    Int spacing_copy(spacing);
+    char* spacing_hex = spacing_copy.GetBase16();
+    printf("    Spacing: 0x%s\n", spacing_hex);
+    free(spacing_hex);
     
     stats.start_time = time(NULL);
     initialized = true;
@@ -195,353 +124,549 @@ bool ExtremeBloomIndex::initialize(const Point& origin, const Int& spacing, uint
     return true;
 }
 
-// Thread function for building bloom filters
-void* ExtremeBloomIndex::threadBuildBloom(void* vargp) {
-    BloomLoadData* data = (BloomLoadData*)vargp;
-    ExtremeBloomIndex* index = (ExtremeBloomIndex*)data->config;
-    std::vector<uint32_t> local_mini_hashes;
-    local_mini_hashes.reserve(1000);
-    
-    Point currentPoint;
-    uint8_t x_coord[32];
-    uint8_t data1[40], data2[16], data3[12];
-    
-    // Process assigned range
-    for (uint64_t i = data->from; i < data->to && !data->should_stop->load(); i++) {
-        // Calculate subtracted point: origin - (i * spacing)
-        Int subtract_value;
-        subtract_value.SetInt64(i);
-        subtract_value.Mult(&data->config->spacing);
-        
-        Point subtract_pubkey = secp->ComputePublicKey(&subtract_value);
-        Point negated = secp->Negation(subtract_pubkey);
-        currentPoint = secp->AddDirect(data->config->origin_pubkey, negated);
-        
-        currentPoint.x.Get32Bytes(x_coord);
-        
-        // Layer 1
-        memcpy(data1, x_coord, 32);
-        memcpy(data1 + 32, &i, 8);
-        
-        uint8_t prefix = x_coord[0];
-#ifdef _WIN64
-        WaitForSingleObject((HANDLE)index->bloom_mutexes[0][prefix], INFINITE);
-        bloom_add(data->bloom_filters[0], data1, 40);
-        ReleaseMutex((HANDLE)index->bloom_mutexes[0][prefix]);
-#else
-        pthread_mutex_lock((pthread_mutex_t*)index->bloom_mutexes[0][prefix]);
-        bloom_add(data->bloom_filters[0], data1, 40);
-        pthread_mutex_unlock((pthread_mutex_t*)index->bloom_mutexes[0][prefix]);
-#endif
-        
-        // Check if it passes layer 1
-        if (bloom_check(data->bloom_filters[0], data1, 40)) {
-            // Layer 2
-            uint64_t h2 = index->hash2(x_coord, i);
-            *(uint64_t*)data2 = h2;
-            *(uint64_t*)(data2 + 8) = i;
-            
-#ifdef _WIN64
-            WaitForSingleObject((HANDLE)index->bloom_mutexes[1][prefix], INFINITE);
-            bloom_add(data->bloom_filters[1], data2, 16);
-            ReleaseMutex((HANDLE)index->bloom_mutexes[1][prefix]);
-#else
-            pthread_mutex_lock((pthread_mutex_t*)index->bloom_mutexes[1][prefix]);
-            bloom_add(data->bloom_filters[1], data2, 16);
-            pthread_mutex_unlock((pthread_mutex_t*)index->bloom_mutexes[1][prefix]);
-#endif
-            
-            // Check if it passes layer 2
-            if (bloom_check(data->bloom_filters[1], data2, 16)) {
-                // Layer 3
-                uint64_t h3 = index->hash3(x_coord, i);
-                *(uint64_t*)data3 = h3;
-                *(uint32_t*)(data3 + 8) = (uint32_t)i;
-                
-#ifdef _WIN64
-                WaitForSingleObject((HANDLE)index->bloom_mutexes[2][prefix], INFINITE);
-                bloom_add(data->bloom_filters[2], data3, 12);
-                ReleaseMutex((HANDLE)index->bloom_mutexes[2][prefix]);
-#else
-                pthread_mutex_lock((pthread_mutex_t*)index->bloom_mutexes[2][prefix]);
-                bloom_add(data->bloom_filters[2], data3, 12);
-                pthread_mutex_unlock((pthread_mutex_t*)index->bloom_mutexes[2][prefix]);
-#endif
-                
-                // Collect mini hash
-                uint32_t mh = index->mini_hash(x_coord, i);
-                local_mini_hashes.push_back(mh);
-            }
-        }
-        
-        // Progress update every 10000 keys
-        if (i % 10000 == 0 && data->thread_id == 0) {
-            printf("\r[+] Thread %d: Progress %llu/%llu (%.1f%%)", 
-                   data->thread_id, i - data->from, data->to - data->from,
-                   (double)(i - data->from) * 100.0 / (data->to - data->from));
-            fflush(stdout);
-        }
+bool ExtremePatternIndex::computePatternPoint(uint64_t index, Point& result) const {
+    if (index == 0 || index > config.num_keys) {
+        return false;
     }
     
-    // Merge local mini hashes into global array
-    if (!local_mini_hashes.empty()) {
-#ifdef _WIN64
-        WaitForSingleObject((HANDLE)data->mini_hash_mutex, INFINITE);
-#else
-        pthread_mutex_lock((pthread_mutex_t*)data->mini_hash_mutex);
-#endif
-        
-        // Append to mini hashes vector
-        data->mini_hashes->insert(data->mini_hashes->end(), 
-                                 local_mini_hashes.begin(), 
-                                 local_mini_hashes.end());
-        
-#ifdef _WIN64
-        ReleaseMutex((HANDLE)data->mini_hash_mutex);
-#else
-        pthread_mutex_unlock((pthread_mutex_t*)data->mini_hash_mutex);
-#endif
-    }
+    // Calculate subtract value: index * spacing
+    Int subtract_value;
+    subtract_value.SetInt64(index);
+    Int spacing_copy(config.spacing);
+    subtract_value.Mult(&spacing_copy);
     
-    data->finished = 1;
-    return NULL;
+    // Compute public key for subtract value
+    Point subtract_pubkey = secp->ComputePublicKey(&subtract_value);
+    
+    // Negate for subtraction
+    Point negated = secp->Negation(subtract_pubkey);
+    
+    // Calculate result: origin - (index * spacing)
+    Point origin_copy(config.origin_pubkey);
+    result = secp->AddDirect(origin_copy, negated);
+    
+    return true;
 }
 
-bool ExtremeBloomIndex::buildIndex(int num_threads) {
+bool ExtremePatternIndex::buildIndex(int num_threads) {
     if (!initialized) return false;
     
-    if (num_threads <= 0) num_threads = 1;
-    if (num_threads > 256) num_threads = 256; // Reasonable limit
+    // Allocate pattern table
+    uint64_t bytes_needed = table_size * sizeof(struct pattern_table_entry);
+    printf("[+] Allocating %.2f MB for pattern table (%llu entries)\n", 
+           bytes_needed / (1024.0 * 1024.0), table_size);
     
-    printf("[+] Building extreme bloom index for %llu keys using %d threads...\n", 
-           config.num_keys, num_threads);
+    patternTable = (struct pattern_table_entry*)malloc(bytes_needed);
+    if (!patternTable) {
+        fprintf(stderr, "[E] Failed to allocate pattern table\n");
+        return false;
+    }
     
-    clock_t start = clock();
+    printf("[+] Building pattern table using %d threads...\n", num_threads);
     
-    // Prepare bloom filter array for threads
-    struct bloom* bloom_array[3] = { layer1, layer2, layer3 };
+    // Initialize mutexes
+#ifdef _WIN64
+    pattern_mutex = (HANDLE*)calloc(num_threads, sizeof(HANDLE));
+    for (int i = 0; i < num_threads; i++) {
+        pattern_mutex[i] = CreateMutex(NULL, FALSE, NULL);
+    }
+#else
+    pattern_mutex = (pthread_mutex_t*)calloc(num_threads, sizeof(pthread_mutex_t));
+    for (int i = 0; i < num_threads; i++) {
+        pthread_mutex_init(&pattern_mutex[i], NULL);
+    }
+#endif
     
-    // Temporary vector to collect mini hashes
-    std::vector<uint32_t> all_mini_hashes;
-    
-    // Set up thread data
-    std::vector<BloomLoadData> thread_data(num_threads);
-    uint64_t keys_per_thread = config.num_keys / num_threads;
-    uint64_t remainder = config.num_keys % num_threads;
+    // Prepare thread data
+    PatternTableBuildInfo* thread_info = (PatternTableBuildInfo*)calloc(num_threads, sizeof(PatternTableBuildInfo));
+    uint64_t entries_per_thread = table_size / num_threads;
+    uint64_t remainder = table_size % num_threads;
     
 #ifdef _WIN64
-    std::vector<HANDLE> threads(num_threads);
+    HANDLE* threads = (HANDLE*)calloc(num_threads, sizeof(HANDLE));
 #else
-    std::vector<pthread_t> threads(num_threads);
+    pthread_t* threads = (pthread_t*)calloc(num_threads, sizeof(pthread_t));
 #endif
     
     // Launch threads
-    uint64_t current_from = 0;
+    uint64_t current_pos = 0;
     for (int i = 0; i < num_threads; i++) {
-        thread_data[i].thread_id = i;
-        thread_data[i].from = current_from;
-        thread_data[i].workload = keys_per_thread + (i < (int)remainder ? 1 : 0);
-        thread_data[i].to = current_from + thread_data[i].workload;
-        thread_data[i].config = &config;
-        thread_data[i].bloom_filters = bloom_array;
-        thread_data[i].mini_hashes = &all_mini_hashes;
-        thread_data[i].mini_hash_count = &mini_hash_count;
-        thread_data[i].should_stop = &stop_flag;
-        thread_data[i].finished = 0;
-        thread_data[i].mini_hash_mutex = mini_hash_mutex;
+        thread_info[i].threadid = i;
+        thread_info[i].from = current_pos;
+        thread_info[i].to = current_pos + entries_per_thread;
+        if (i == num_threads - 1) {
+            thread_info[i].to += remainder;
+        }
+        thread_info[i].finished = 0;
+        thread_info[i].parent = this;
+        thread_info[i].table = patternTable;
         
-        current_from = thread_data[i].to;
+        current_pos = thread_info[i].to;
         
 #ifdef _WIN64
-        threads[i] = CreateThread(NULL, 0, 
-                                 (LPTHREAD_START_ROUTINE)threadBuildBloom, 
-                                 &thread_data[i], 0, NULL);
+        DWORD thread_id;
+        threads[i] = CreateThread(NULL, 0, thread_pattern_table_build, 
+                                &thread_info[i], 0, &thread_id);
 #else
-        pthread_create(&threads[i], NULL, threadBuildBloom, &thread_data[i]);
+        pthread_create(&threads[i], NULL, thread_pattern_table_build, 
+                      &thread_info[i]);
 #endif
     }
     
     // Wait for all threads to complete
-    for (int i = 0; i < num_threads; i++) {
+    clock_t start_time = clock();
+    uint32_t all_finished = 0;
+    while (all_finished < num_threads) {
+        all_finished = 0;
+        for (int i = 0; i < num_threads; i++) {
 #ifdef _WIN64
-        WaitForSingleObject(threads[i], INFINITE);
-        CloseHandle(threads[i]);
+            WaitForSingleObject(pattern_mutex[i], INFINITE);
+            all_finished += thread_info[i].finished;
+            ReleaseMutex(pattern_mutex[i]);
 #else
-        pthread_join(threads[i], NULL);
+            pthread_mutex_lock(&pattern_mutex[i]);
+            all_finished += thread_info[i].finished;
+            pthread_mutex_unlock(&pattern_mutex[i]);
+#endif
+        }
+        
+        // Show progress
+        uint64_t total_done = 0;
+        for (int i = 0; i < num_threads; i++) {
+            if (thread_info[i].finished) {
+                total_done += (thread_info[i].to - thread_info[i].from);
+            }
+        }
+        printf("\r[+] Building pattern table: %llu/%llu (%.1f%%)", 
+               total_done, table_size, (double)total_done * 100.0 / table_size);
+        fflush(stdout);
+        
+#ifdef _WIN64
+        Sleep(100);
+#else
+        usleep(100000);
 #endif
     }
     
-    // Sort and store mini hashes
-    std::sort(all_mini_hashes.begin(), all_mini_hashes.end());
-    mini_hash_count = all_mini_hashes.size();
+    clock_t end_time = clock();
+    double seconds = (double)(end_time - start_time) / CLOCKS_PER_SEC;
+    printf("\n[+] Built pattern table in %.2f seconds\n", seconds);
     
-    if (mini_hashes) free(mini_hashes);
-    mini_hashes = (uint32_t*)malloc(mini_hash_count * sizeof(uint32_t));
-    memcpy(mini_hashes, all_mini_hashes.data(), mini_hash_count * sizeof(uint32_t));
+    // Sort the table
+    printf("[+] Sorting pattern table...\n");
+    sortPatternTable();
     
-    clock_t end = clock();
-    double seconds = (double)(end - start) / CLOCKS_PER_SEC;
+    // Cleanup
+#ifdef _WIN64
+    for (int i = 0; i < num_threads; i++) {
+        CloseHandle(threads[i]);
+        CloseHandle(pattern_mutex[i]);
+    }
+#else
+    for (int i = 0; i < num_threads; i++) {
+        pthread_join(threads[i], NULL);
+        pthread_mutex_destroy(&pattern_mutex[i]);
+    }
+#endif
     
-    printf("\n[+] Built index in %.2f seconds (%.2f million keys/sec)\n",
-           seconds, config.num_keys / seconds / 1e6);
-    printf("[+] Mini hashes collected: %llu\n", mini_hash_count);
+    free(threads);
+    free(thread_info);
+    free(pattern_mutex);
     
-    displayStats();
     return true;
 }
 
-bool ExtremeBloomIndex::checkKey(const Point& test_key, uint64_t& found_index, Int* original_private_key) {
-    if (!initialized) return false;
+// Thread function to build pattern table
+#ifdef _WIN64
+DWORD WINAPI thread_pattern_table_build(LPVOID vargp)
+#else
+void* thread_pattern_table_build(void* vargp)
+#endif
+{
+    PatternTableBuildInfo* info = (PatternTableBuildInfo*)vargp;
+    ExtremePatternIndex* parent = info->parent;
     
-    stats.checks++;
-    
-    Point test_key_copy(test_key);
-    uint8_t x_coord[32];
-    test_key_copy.x.Get32Bytes(x_coord);
-    
-    // Try all possible indices with progressive filtering
-    for (uint64_t i = 0; i < config.num_keys; i++) {
-        // Layer 1 check
-        uint8_t data1[40];
-        memcpy(data1, x_coord, 32);
-        memcpy(data1 + 32, &i, 8);
+    for (uint64_t i = info->from; i < info->to; i++) {
+        uint64_t pattern_index = i * parent->step_size;
+        if (pattern_index > parent->config.num_keys) break;
         
-        if (!bloom_check(layer1, data1, 40)) {
-            continue;
-        }
+        Point pattern_point;
+        parent->computePatternPoint(pattern_index, pattern_point);
         
-        stats.layer1_hits++;
+        // Get X coordinate bytes
+        unsigned char x_bytes[32];
+        pattern_point.x.Get32Bytes(x_bytes);
         
-        // Layer 2 check
-        uint8_t data2[16];
-        *(uint64_t*)data2 = hash2(x_coord, i);
-        *(uint64_t*)(data2 + 8) = i;
+        // Store 6 bytes from middle of X coordinate (like BSGS)
+        memcpy(info->table[i].value, x_bytes + 16, 6);
+        info->table[i].index = pattern_index;
         
-        if (!bloom_check(layer2, data2, 16)) {
-            continue;
-        }
-        
-        stats.layer2_hits++;
-        
-        // Layer 3 check
-        uint8_t data3[12];
-        *(uint64_t*)data3 = hash3(x_coord, i);
-        *(uint32_t*)(data3 + 8) = (uint32_t)i;
-        
-        if (!bloom_check(layer3, data3, 12)) {
-            continue;
-        }
-        
-        stats.layer3_hits++;
-        
-        // Final verification - check mini hash
-        uint32_t mh = mini_hash(x_coord, i);
-        if (!std::binary_search(mini_hashes, mini_hashes + mini_hash_count, mh)) {
-            continue;
-        }
-        
-        // Ultimate verification - reconstruct and compare
-        stats.reconstructions++;
-        
-        Int subtract_value;
-        subtract_value.SetInt64(i);
-        subtract_value.Mult(&config.spacing);
-        
-        Point subtract_pubkey = secp->ComputePublicKey(&subtract_value);
-        Point negated = secp->Negation(subtract_pubkey);
-        Point reconstructed = secp->AddDirect(config.origin_pubkey, negated);
-        
-        Int test_x_copy(test_key_copy.x);
-        if (reconstructed.x.IsEqual(&test_x_copy)) {
-            stats.found++;
-            found_index = i;
-            
-            // Calculate original private key if requested
-            if (original_private_key) {
-                // The original private key = database_private_key + (index * spacing)
-                // Since we found that: origin_pubkey - (index * spacing) = database_pubkey
-                // Then: origin_private = database_private + (index * spacing)
-                original_private_key->Set(&subtract_value);
-            }
-            
-            // Set stop flag if configured
-            if (config.stop_on_first_find) {
-                stop_flag = true;
-            }
-            
-            return true;
+        // Add to bloom filter if enabled
+        if (parent->use_bloom && parent->quick_filter) {
+            bloom_add(parent->quick_filter, x_bytes, 32);
         }
     }
     
+    // Mark as finished
+#ifdef _WIN64
+    WaitForSingleObject(pattern_mutex[info->threadid], INFINITE);
+    info->finished = 1;
+    ReleaseMutex(pattern_mutex[info->threadid]);
+#else
+    pthread_mutex_lock(&pattern_mutex[info->threadid]);
+    info->finished = 1;
+    pthread_mutex_unlock(&pattern_mutex[info->threadid]);
+#endif
+    
+    return NULL;
+}
+
+void ExtremePatternIndex::sortPatternTable() {
+    pattern_sort(patternTable, table_size);
+}
+
+int ExtremePatternIndex::binarySearchPattern(const unsigned char* xpoint_raw, 
+                                           uint64_t* found_indices, int* num_found) {
+    *num_found = 0;
+    
+    // Extract search value (6 bytes from position 16)
+    unsigned char search_value[6];
+    memcpy(search_value, xpoint_raw + 16, 6);
+    
+    // Binary search
+    int64_t left = 0, right = table_size - 1;
+    int64_t first_match = -1;
+    
+    while (left <= right) {
+        int64_t mid = (left + right) / 2;
+        int cmp = memcmp(search_value, patternTable[mid].value, 6);
+        
+        if (cmp == 0) {
+            first_match = mid;
+            // Find first occurrence
+            while (first_match > 0 && 
+                   memcmp(search_value, patternTable[first_match - 1].value, 6) == 0) {
+                first_match--;
+            }
+            break;
+        } else if (cmp < 0) {
+            right = mid - 1;
+        } else {
+            left = mid + 1;
+        }
+    }
+    
+    if (first_match == -1) {
+        return 0; // Not found
+    }
+    
+    // Collect all matching indices
+    int64_t pos = first_match;
+    while (pos < table_size && 
+           memcmp(search_value, patternTable[pos].value, 6) == 0 && 
+           *num_found < 10) { // Limit to 10 candidates
+        found_indices[*num_found] = patternTable[pos].index;
+        (*num_found)++;
+        pos++;
+    }
+    
+    return 1; // Found candidates
+}
+
+bool ExtremePatternIndex::checkKey(const Point& test_key, uint64_t& found_index, Int* original_offset) {
+    if (!initialized || !patternTable) return false;
+    
+    stats.checks++;
+    
+    // Get X coordinate
+    unsigned char xpoint_raw[32];
+    Point test_key_copy(test_key);
+    test_key_copy.x.Get32Bytes(xpoint_raw);
+    
+    // Quick bloom filter check
+    if (use_bloom && quick_filter) {
+        if (!bloom_check(quick_filter, xpoint_raw, 32)) {
+            stats.bloom_misses++;
+            return false;
+        }
+        stats.bloom_hits++;
+    }
+    
+    // Binary search for candidates
+    uint64_t candidate_indices[10];
+    int num_candidates = 0;
+    
+    if (!binarySearchPattern(xpoint_raw, candidate_indices, &num_candidates)) {
+        stats.false_positives++;
+        return false;
+    }
+    
+    // Check each candidate and nearby points
+    for (int i = 0; i < num_candidates; i++) {
+        uint64_t base_index = candidate_indices[i];
+        
+        // Check points around this index (within step_size)
+        uint64_t start = (base_index > step_size) ? base_index - step_size : 0;
+        uint64_t end = std::min(base_index + step_size, config.num_keys);
+        
+        for (uint64_t check_index = start; check_index <= end; check_index++) {
+            Point check_point;
+            if (!computePatternPoint(check_index, check_point)) {
+                continue;
+            }
+            
+            if (test_key_copy.x.IsEqual(&check_point.x) && 
+                test_key_copy.y.IsEqual(&check_point.y)) {
+                found_index = check_index;
+                
+                if (original_offset) {
+                    original_offset->SetInt64(check_index);
+                    Int spacing_copy(config.spacing);
+                    original_offset->Mult(&spacing_copy);
+                }
+                
+                stats.found++;
+                
+                if (config.stop_on_first_find) {
+                    stop_flag = true;
+                }
+                
+                return true;
+            }
+        }
+    }
+    
+    stats.false_positives++;
     return false;
 }
 
-void ExtremeBloomIndex::getMemoryStats(uint64_t& total_bytes, double& bytes_per_key) {
-    total_bytes = 0;
-    if (layer1) total_bytes += layer1->bytes;
-    if (layer2) total_bytes += layer2->bytes;
-    if (layer3) total_bytes += layer3->bytes;
-    total_bytes += mini_hash_count * sizeof(uint32_t);
+int ExtremePatternIndex::checkBatch(Point* test_keys, int batch_size, uint64_t* found_indices) {
+    int matches = 0;
+    
+    for (int i = 0; i < batch_size; i++) {
+        if (checkKey(test_keys[i], found_indices[i], nullptr)) {
+            matches++;
+        } else {
+            found_indices[i] = 0; // 0 indicates no match
+        }
+        
+        if (stop_flag) {
+            break;
+        }
+    }
+    
+    return matches;
+}
+
+void ExtremePatternIndex::getMemoryStats(uint64_t& total_bytes, double& bytes_per_key) {
+    total_bytes = sizeof(*this);
+    
+    if (patternTable) {
+        total_bytes += table_size * sizeof(struct pattern_table_entry);
+    }
+    
+    if (quick_filter) {
+        total_bytes += quick_filter->bytes;
+    }
     
     bytes_per_key = (double)total_bytes / config.num_keys;
 }
 
-void ExtremeBloomIndex::displayStats() {
-    uint64_t total_bytes;
-    double bytes_per_key;
-    getMemoryStats(total_bytes, bytes_per_key);
-    
-    printf("\n[+] Extreme Bloom Index Statistics:\n");
-    printf("    ================================\n");
-    printf("    Total memory: %.2f MB\n", total_bytes / (1024.0 * 1024.0));
-    printf("    Bits per key: %.3f\n", bytes_per_key * 8);
-    printf("    Bytes per key: %.4f\n", bytes_per_key);
-    
-    if (stats.checks > 0) {
-        printf("\n    Filter cascade performance:\n");
-        printf("    Layer 1 hits: %llu (%.2f%% pass rate)\n", 
-               stats.layer1_hits, (double)stats.layer1_hits * 100 / stats.checks);
-        if (stats.layer1_hits > 0) {
-            printf("    Layer 2 hits: %llu (%.2f%% of L1)\n", 
-                   stats.layer2_hits, (double)stats.layer2_hits * 100 / stats.layer1_hits);
-        }
-        if (stats.layer2_hits > 0) {
-            printf("    Layer 3 hits: %llu (%.2f%% of L2)\n", 
-                   stats.layer3_hits, (double)stats.layer3_hits * 100 / stats.layer2_hits);
-        }
-        printf("    Reconstructions: %llu\n", stats.reconstructions);
-        printf("    Keys found: %llu\n", stats.found);
-    }
-}
-
-void ExtremeBloomIndex::displayCapacityTable() {
-    printf("\n[+] Extreme Bloom Index Capacity Table:\n");
+void ExtremePatternIndex::displayCapacityTable() {
+    printf("\n[+] Extreme Pattern Index Capacity Table:\n");
     printf("    ===================================\n");
-    printf("    (With improved false positive rates)\n\n");
+    printf("    Pattern matching with binary search\n\n");
     
-    double bits_per_key = 8.0;  // More realistic with better FPP
-    double bytes_per_key = bits_per_key / 8.0;
+    printf("    Dataset Size   | Table Memory  | Step Size | Search Speed\n");
+    printf("    ---------------|---------------|-----------|-------------\n");
+    printf("    1 Million      | 12 MB         | 1         | O(log n)\n");
+    printf("    10 Million     | 100 MB        | 1         | O(log n)\n");
+    printf("    100 Million    | 100 MB        | 10        | O(log n)\n");
+    printf("    1 Billion      | 100 MB        | 100       | O(log n)\n");
+    printf("    10 Billion     | 100 MB        | 1000      | O(log n)\n");
+    printf("    100 Billion    | 100 MB        | 10000     | O(log n)\n");
     
-    uint64_t gb = 1024ULL * 1024 * 1024;
-    
-    printf("    Memory     |  Capacity\n");
-    printf("    -----------|-----------------\n");
-    for (uint64_t mem_gb = 1; mem_gb <= 512; mem_gb *= 2) {
-        uint64_t capacity = (mem_gb * gb) / (uint64_t)(bytes_per_key);
-        if (capacity >= 1000000000000) {
-            printf("    %3llu GB     |  %.1f trillion keys\n", 
-                   mem_gb, capacity / 1000000000000.0);
-        } else {
-            printf("    %3llu GB     |  %llu billion keys\n", 
-                   mem_gb, capacity / 1000000000);
-        }
-    }
-    printf("    1 TB       |  %.1f trillion keys\n", 
-           (1024 * gb) / (uint64_t)(bytes_per_key) / 1000000000000.0);
+    printf("\n    Note: Memory usage is capped at ~100MB for the pattern table\n");
+    printf("    Larger datasets use larger step sizes\n");
 }
 
-// Global functions
+bool ExtremePatternIndex::saveTable(const char* filename) {
+    FILE* fp = fopen(filename, "wb");
+    if (!fp) return false;
+    
+    // Write header
+    fwrite(&table_size, sizeof(uint64_t), 1, fp);
+    fwrite(&step_size, sizeof(uint64_t), 1, fp);
+    fwrite(&config.num_keys, sizeof(uint64_t), 1, fp);
+    
+    // Write spacing
+    Int spacing_copy(config.spacing);
+    char* spacing_hex = spacing_copy.GetBase16();
+    uint32_t hex_len = strlen(spacing_hex);
+    fwrite(&hex_len, sizeof(uint32_t), 1, fp);
+    fwrite(spacing_hex, 1, hex_len, fp);
+    free(spacing_hex);
+    
+    // Write origin point
+    unsigned char origin_bytes[65];
+    config.origin_pubkey.x.Get32Bytes(origin_bytes);
+    config.origin_pubkey.y.Get32Bytes(origin_bytes + 32);
+    origin_bytes[64] = config.origin_pubkey.y.IsEven() ? 0 : 1;
+    fwrite(origin_bytes, 65, 1, fp);
+    
+    // Write table
+    fwrite(patternTable, sizeof(struct pattern_table_entry), table_size, fp);
+    
+    fclose(fp);
+    return true;
+}
+
+bool ExtremePatternIndex::loadTable(const char* filename) {
+    FILE* fp = fopen(filename, "rb");
+    if (!fp) return false;
+    
+    // Read header
+    fread(&table_size, sizeof(uint64_t), 1, fp);
+    fread(&step_size, sizeof(uint64_t), 1, fp);
+    fread(&config.num_keys, sizeof(uint64_t), 1, fp);
+    
+    // Read spacing
+    uint32_t hex_len;
+    fread(&hex_len, sizeof(uint32_t), 1, fp);
+    char* spacing_hex = (char*)malloc(hex_len + 1);
+    fread(spacing_hex, 1, hex_len, fp);
+    spacing_hex[hex_len] = '\0';
+    config.spacing.SetBase16(spacing_hex);
+    free(spacing_hex);
+    
+    // Read origin point
+    unsigned char origin_bytes[65];
+    fread(origin_bytes, 65, 1, fp);
+    config.origin_pubkey.x.Set32Bytes(origin_bytes);
+    config.origin_pubkey.y.Set32Bytes(origin_bytes + 32);
+    if (origin_bytes[64]) {
+        config.origin_pubkey.y.ModNeg();
+    }
+    
+    // Allocate and read table
+    uint64_t bytes_needed = table_size * sizeof(struct pattern_table_entry);
+    patternTable = (struct pattern_table_entry*)malloc(bytes_needed);
+    if (!patternTable) {
+        fclose(fp);
+        return false;
+    }
+    
+    fread(patternTable, sizeof(struct pattern_table_entry), table_size, fp);
+    
+    fclose(fp);
+    initialized = true;
+    return true;
+}
+
+// Sorting functions (adapted from BSGS)
+void pattern_swap(struct pattern_table_entry *a, struct pattern_table_entry *b) {
+    struct pattern_table_entry t;
+    t = *a;
+    *a = *b;
+    *b = t;
+}
+
+void pattern_sort(struct pattern_table_entry *arr, int64_t n) {
+    uint32_t depthLimit = ((uint32_t)ceil(log(n))) * 2;
+    pattern_introsort(arr, depthLimit, n);
+}
+
+void pattern_introsort(struct pattern_table_entry *arr, uint32_t depthLimit, int64_t n) {
+    int64_t p;
+    if (n > 1) {
+        if (n <= 16) {
+            pattern_insertionsort(arr, n);
+        } else {
+            if (depthLimit == 0) {
+                pattern_heapsort(arr, n);
+            } else {
+                p = pattern_partition(arr, n);
+                if (p > 0)
+                    pattern_introsort(arr, depthLimit - 1, p);
+                if (p < n)
+                    pattern_introsort(&arr[p + 1], depthLimit - 1, n - (p + 1));
+            }
+        }
+    }
+}
+
+void pattern_insertionsort(struct pattern_table_entry *arr, int64_t n) {
+    int64_t j;
+    int64_t i;
+    struct pattern_table_entry key;
+    for (i = 1; i < n; i++) {
+        key = arr[i];
+        j = i - 1;
+        while (j >= 0 && memcmp(arr[j].value, key.value, 6) > 0) {
+            arr[j + 1] = arr[j];
+            j--;
+        }
+        arr[j + 1] = key;
+    }
+}
+
+int64_t pattern_partition(struct pattern_table_entry *arr, int64_t n) {
+    struct pattern_table_entry pivot;
+    int64_t r, left, right;
+    r = n / 2;
+    pivot = arr[r];
+    left = 0;
+    right = n - 1;
+    do {
+        while (left < right && memcmp(arr[left].value, pivot.value, 6) <= 0) {
+            left++;
+        }
+        while (right >= left && memcmp(arr[right].value, pivot.value, 6) > 0) {
+            right--;
+        }
+        if (left < right) {
+            if (left == r) {
+                r = right;
+            } else if (right == r) {
+                r = left;
+            }
+            pattern_swap(&arr[right], &arr[left]);
+        }
+    } while (left < right);
+    if (right != r) {
+        pattern_swap(&arr[right], &arr[r]);
+    }
+    return right;
+}
+
+void pattern_heapify(struct pattern_table_entry *arr, int64_t n, int64_t i) {
+    int64_t largest = i;
+    int64_t l = 2 * i + 1;
+    int64_t r = 2 * i + 2;
+    if (l < n && memcmp(arr[l].value, arr[largest].value, 6) > 0)
+        largest = l;
+    if (r < n && memcmp(arr[r].value, arr[largest].value, 6) > 0)
+        largest = r;
+    if (largest != i) {
+        pattern_swap(&arr[i], &arr[largest]);
+        pattern_heapify(arr, n, largest);
+    }
+}
+
+void pattern_heapsort(struct pattern_table_entry *arr, int64_t n) {
+    int64_t i;
+    for (i = (n / 2) - 1; i >= 0; i--) {
+        pattern_heapify(arr, n, i);
+    }
+    for (i = n - 1; i > 0; i--) {
+        pattern_swap(&arr[0], &arr[i]);
+        pattern_heapify(arr, i, 0);
+    }
+}
+
+// Global initialization function
 bool initializeExtremeIndex(const char* params, const char* origin_pubkey_hex, int num_threads) {
+    // Parse parameters
     char* params_copy = strdup(params);
     char* token = strtok(params_copy, " ");
     
@@ -557,6 +682,7 @@ bool initializeExtremeIndex(const char* params, const char* origin_pubkey_hex, i
     
     free(params_copy);
     
+    // Parse origin public key
     Point origin;
     bool compressed = (strlen(origin_pubkey_hex) == 66);
     if (!secp->ParsePublicKeyHex((char*)origin_pubkey_hex, origin, compressed)) {
@@ -564,37 +690,37 @@ bool initializeExtremeIndex(const char* params, const char* origin_pubkey_hex, i
         return false;
     }
     
-    if (g_extreme_index) delete g_extreme_index;
-    g_extreme_index = new ExtremeBloomIndex();
+    // Create new index
+    if (g_extreme_pattern_index) delete g_extreme_pattern_index;
+    g_extreme_pattern_index = new ExtremePatternIndex();
     
-    // You can set custom FPP rates here if needed
-    // g_extreme_index->setFalsePositiveRates(0.001, 0.0001, 0.00001);
-    
-    if (!g_extreme_index->initialize(origin, spacing, count)) {
-        delete g_extreme_index;
-        g_extreme_index = nullptr;
+    if (!g_extreme_pattern_index->initialize(origin, spacing, count)) {
+        delete g_extreme_pattern_index;
+        g_extreme_pattern_index = nullptr;
         return false;
     }
     
-    ExtremeBloomIndex::displayCapacityTable();
+    ExtremePatternIndex::displayCapacityTable();
     
-    // Use the provided number of threads
-    return g_extreme_index->buildIndex(num_threads > 0 ? num_threads : NTHREADS);
+    // Build the index
+    return g_extreme_pattern_index->buildIndex(num_threads);
 }
 
-void writeExtremeKey(uint64_t index, const Int& subtract_value, const Point& found_point, const Int* found_private_key, const Point& origin_point) {
+// Write found key
+void writeExtremeKey(uint64_t index, const Int& subtract_value, const Point& found_point, 
+                    const Int* found_private_key, const Point& /*origin_point*/) {
     FILE* fp = fopen("KEYFOUNDKEYFOUND.txt", "a");
     if (fp) {
         Point point_copy(found_point);
         
-        // Make non-const copies for GetBase16()
+        // Get hex strings
         Int subtract_copy(subtract_value);
         char* subtract_hex = subtract_copy.GetBase16();
         char* point_hex = secp->GetPublicKeyHex(true, point_copy);
         
-        fprintf(fp, "Extreme Bloom Index - KEY FOUND!\n");
+        fprintf(fp, "Extreme Pattern Index - KEY FOUND!\n");
         fprintf(fp, "=====================================\n");
-        fprintf(fp, "Index: %llu\n", index);
+        fprintf(fp, "Pattern position: %llu\n", index);
         fprintf(fp, "Subtract value: 0x%s\n", subtract_hex);
         fprintf(fp, "\n");
         
@@ -609,7 +735,7 @@ void writeExtremeKey(uint64_t index, const Int& subtract_value, const Point& fou
             
             // Calculate and show the original key pair
             Int original_private_key;
-            original_private_key.Set(&found_key_copy);  // Use the non-const copy
+            original_private_key.Set(&found_key_copy);
             
             // Make a non-const copy of subtract_value for Add
             Int subtract_for_add(subtract_value);
@@ -632,9 +758,9 @@ void writeExtremeKey(uint64_t index, const Int& subtract_value, const Point& fou
         fclose(fp);
         
         // Also print to console
-        printf("\n[+] Extreme Bloom Index - KEY FOUND!\n");
+        printf("\n[+] Extreme Pattern Index - KEY FOUND!\n");
         printf("=====================================\n");
-        printf("Index: %llu\n", index);
+        printf("Pattern position: %llu\n", index);
         printf("Subtract value: 0x%s\n", subtract_hex);
         
         if (found_private_key) {
@@ -644,11 +770,9 @@ void writeExtremeKey(uint64_t index, const Int& subtract_value, const Point& fou
             printf("Private Key: 0x%s\n", found_private_hex);
             printf("Public Key: %s\n", point_hex);
             
-            // Calculate and show the original key pair
+            // Calculate original
             Int original_private_key;
-            original_private_key.Set(&found_key_copy);  // Use the non-const copy
-            
-            // Make a non-const copy of subtract_value for Add
+            original_private_key.Set(&found_key_copy);
             Int subtract_for_add(subtract_value);
             original_private_key.Add(&subtract_for_add);
             
