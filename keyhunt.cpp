@@ -378,7 +378,7 @@ int FLAGINDEXBLOOM = 0;
 uint64_t index_bloom_count = 0;
 Int index_bloom_spacing;
 Point index_bloom_origin;
-extern ExtremeBloomIndex* g_extreme_index;
+extern ExtremePatternIndex* g_extreme_pattern_index;
 
 //Xpoint Bloom Load
 bool FLAGSUBTRACTBLOOM = false;
@@ -420,6 +420,7 @@ int FLAGRAWDATA = 0;
 int FLAGRANDOM = 0;
 int FLAG_N = 0;
 int FLAGPRECALCUTED_P_FILE = 0;
+
 // publickey Print
 int FLAGPRINTPUBKEYS = 0;
 FILE *pubkeyfile = NULL;
@@ -1020,7 +1021,7 @@ if (FLAGFILE && FLAGMODE == MODE_XPOINT) {
             exit(EXIT_FAILURE);
         }
 
-        if (!initializeExtremeIndex(fileName, targetSubtractKeyStrs[0].c_str())) {
+        if (!initializeExtremeIndex(fileName, targetSubtractKeyStrs[0].c_str(), NTHREADS)) {
             fprintf(stderr, "[E] Failed to initialize index bloom\n");
             free(file_copy);
             exit(EXIT_FAILURE);
@@ -2866,9 +2867,6 @@ case MODE_SUBTRACT:
                 free(str_pretotal);
                 free(str_total);
 
-                if (FLAGINDEXBLOOM && g_extreme_index && FLAGMODE == MODE_XPOINT) {
-    g_extreme_index->displayStats(); // Display current statistics
-}
             }
         }
     } while (continue_flag);
@@ -2980,9 +2978,9 @@ case MODE_SUBTRACT:
         bloom_free(&bloom_subtract);
     }
 
-   if (g_extreme_index) {
-    delete g_extreme_index;
-    g_extreme_index = nullptr;
+   if (g_extreme_pattern_index) {
+    delete g_extreme_pattern_index;
+    g_extreme_pattern_index = nullptr;
 }
 
     delete secp;
@@ -5190,11 +5188,11 @@ void *thread_process(void *vargp)
                         }
                         break;
                     case MODE_XPOINT:
-    if (FLAGINDEXBLOOM && g_extreme_index) {
+    if (FLAGINDEXBLOOM && g_extreme_pattern_index) {
         for (k = 0; k < 4; k++) {
             uint64_t found_index;
             Int original_offset;
-            if (g_extreme_index->checkKey(pts[(4 * j) + k], found_index, &original_offset)) {
+            if (g_extreme_pattern_index->checkKey(pts[(4 * j) + k], found_index, &original_offset)) {
                 // Calculate the actual private key that was checked
                 Int keyfound;
                 keyfound.SetInt32(k);
@@ -5202,19 +5200,14 @@ void *thread_process(void *vargp)
                 keyfound.Add(&key_mpz);
                 
                 // Pass the origin point from the extreme index
-                Point origin_point = g_extreme_index->getOriginPoint();
+                Point origin_point = g_extreme_pattern_index->getOriginPoint();
                 
                 // Write the result with the found private key
                 writeExtremeKey(found_index, original_offset, pts[(4 * j) + k], &keyfound, origin_point);
                 
-                // Optional: Display real-time stats
-                if (FLAGQUIET == 0) {
-                    printf("\n[+] Match found! Check KEYFOUNDKEYFOUND.txt for details\n");
-                    g_extreme_index->displayStats();
-                }
                 
                 // Stop all threads if stop_on_first_find is enabled
-                if (g_extreme_index->shouldStop()) {
+                if (g_extreme_pattern_index->shouldStop()) {
                     printf("\n[+] Stopping all threads as requested (stop on first find)\n");
                     for (int t = 0; t < NTHREADS; t++) {
                         ends[t] = 1;
