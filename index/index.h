@@ -10,110 +10,145 @@
 #include "../secp256k1/Int.h"
 #include "../bloom/bloom.h"
 
-// Configuration for extreme compression
-struct ExtremeConfig {
+#ifdef _WIN64
+#include <windows.h>
+#else
+#include <pthread.h>
+#include <unistd.h>
+#endif
+
+// Forward declarations
+class ExtremePatternIndex;
+struct PatternBPload;
+
+// Thread function declarations
+#ifdef _WIN64
+DWORD WINAPI thread_pattern_table_build(LPVOID vargp);
+#else
+void* thread_pattern_table_build(void* vargp);
+#endif
+
+// Configuration for pattern-based key matching
+struct PatternConfig {
     Point origin_pubkey;
     Int spacing;
     uint64_t num_keys;
-    uint8_t bloom_layers;      // Number of bloom filter layers (2-4)
-    double bits_per_key_base;  // Base bits per key
-    double fpp_layer1;         // False positive probability for layer 1
-    double fpp_layer2;         // False positive probability for layer 2  
-    double fpp_layer3;         // False positive probability for layer 3
-    bool stop_on_first_find;   // Stop after finding first key
+    bool stop_on_first_find;
 };
 
-// Thread data for parallel bloom loading
-struct BloomLoadData {
-    uint32_t thread_id;
+// Pattern table entry - similar to BSGS
+struct pattern_table_entry {
+    uint8_t value[6];   // 6 bytes from X coordinate (like BSGS)
+    uint64_t index;     // Pattern index
+};
+
+// Thread structure for pattern table building
+struct PatternTableBuildInfo {
+    uint32_t threadid;
     uint64_t from;
     uint64_t to;
-    uint64_t workload;
-    ExtremeConfig* config;
-    struct bloom** bloom_filters;
-    std::vector<uint32_t>* mini_hashes;  // Changed from uint32_t** to vector*
-    uint64_t* mini_hash_count;
-    std::atomic<bool>* should_stop;
     uint32_t finished;
-    void* mini_hash_mutex;  // Added this field
+    ExtremePatternIndex* parent;
+    struct pattern_table_entry* table;
 };
 
-// Multi-layer bloom filter for extreme compression
-class ExtremeBloomIndex {
+// Ultra-efficient pattern-based index for arithmetic progressions
+class ExtremePatternIndex {
 private:
-    ExtremeConfig config;
+    PatternConfig config;
     
-    // Multiple bloom filters with decreasing sizes
-    struct bloom* layer1;
-    struct bloom* layer2;  
-    struct bloom* layer3;
+    // Pattern table for binary search (like BSGS bPtable)
+    struct pattern_table_entry* patternTable;
+    uint64_t table_size;
+    uint64_t step_size;  // Store every Nth point
     
-    // Ultra-minimal verification data
-    uint32_t* mini_hashes;     // 4-byte hashes for final verification
-    uint64_t mini_hash_count;  // Number of entries in mini_hashes
-    
-    // Thread synchronization
-    void* bloom_mutexes[3][256]; // Mutexes for each bloom layer and byte prefix
-    void* mini_hash_mutex;
+    // Optional bloom filter for large datasets
+    struct bloom* quick_filter;
+    bool use_bloom;
     
     // Statistics
     struct {
         uint64_t checks;
-        uint64_t layer1_hits;
-        uint64_t layer2_hits;
-        uint64_t layer3_hits;
-        uint64_t reconstructions;
+        uint64_t bloom_hits;
+        uint64_t bloom_misses;
         uint64_t found;
+        uint64_t false_positives;
         time_t start_time;
     } stats;
     
     bool initialized;
     std::atomic<bool> stop_flag;
     
-    // Hash functions for different layers
-    uint64_t hash1(const uint8_t* data, uint64_t index);
-    uint64_t hash2(const uint8_t* data, uint64_t index);
-    uint64_t hash3(const uint8_t* data, uint64_t index);
-    uint32_t mini_hash(const uint8_t* data, uint64_t index);
+    // Helper functions
+    bool computePatternPoint(uint64_t index, Point& result) const;
+    void sortPatternTable();
+    int binarySearchPattern(const unsigned char* xpoint_raw, uint64_t* found_indices, int* num_found);
     
-    // Thread function for parallel loading
-    static void* threadBuildBloom(void* vargp);
+    // Friend function for thread access
+#ifdef _WIN64
+    friend DWORD WINAPI thread_pattern_table_build(LPVOID vargp);
+#else
+    friend void* thread_pattern_table_build(void* vargp);
+#endif
     
 public:
-    ExtremeBloomIndex();
-    ~ExtremeBloomIndex();
+    ExtremePatternIndex();
+    ~ExtremePatternIndex();
 
+    // Get origin point for external use
     Point getOriginPoint() const { return config.origin_pubkey; }
     bool shouldStop() const { return stop_flag; }
     
-    // Initialize with extreme settings
+    // Initialize with pattern parameters
     bool initialize(const Point& origin, const Int& spacing, uint64_t num_keys);
     
-    // Build the multi-layer index with threading
+    // Build the pattern table
     bool buildIndex(int num_threads = 1);
     
-    // Check with 100% accuracy and recover original key
-    bool checkKey(const Point& test_key, uint64_t& found_index, Int* original_private_key = nullptr);
+    // Check if a point matches our pattern
+    bool checkKey(const Point& test_key, uint64_t& found_index, Int* original_offset = nullptr);
+    
+    // Batch checking for better performance
+    int checkBatch(Point* test_keys, int batch_size, uint64_t* found_indices);
     
     // Get memory usage
     void getMemoryStats(uint64_t& total_bytes, double& bytes_per_key);
     
-    // Display statistics
-    void displayStats();
+    // Display capacity table only
     static void displayCapacityTable();
-    
-    // Set custom false positive rates
-    void setFalsePositiveRates(double fpp1, double fpp2, double fpp3);
     
     // Enable/disable stop on first find
     void setStopOnFirstFind(bool stop) { config.stop_on_first_find = stop; }
+    
+    // Save/Load pattern table for faster startup
+    bool saveTable(const char* filename);
+    bool loadTable(const char* filename);
+
+    const PatternConfig& getConfig() const { return config; }
 };
 
+// Sorting functions for pattern table
+void pattern_swap(struct pattern_table_entry *a, struct pattern_table_entry *b);
+void pattern_sort(struct pattern_table_entry *arr, int64_t n);
+void pattern_introsort(struct pattern_table_entry *arr, uint32_t depthLimit, int64_t n);
+void pattern_insertionsort(struct pattern_table_entry *arr, int64_t n);
+int64_t pattern_partition(struct pattern_table_entry *arr, int64_t n);
+void pattern_heapify(struct pattern_table_entry *arr, int64_t n, int64_t i);
+void pattern_heapsort(struct pattern_table_entry *arr, int64_t n);
+
 // Global instance
-extern ExtremeBloomIndex* g_extreme_index;
+extern ExtremePatternIndex* g_extreme_pattern_index;
+extern Secp256K1* secp;
+extern int NTHREADS;
+
+// Global points for faster computation
+extern Point* g_spacing_point;
+extern Point* g_negated_spacing;
+
 
 // High-level functions
 bool initializeExtremeIndex(const char* params, const char* origin_pubkey_hex, int num_threads = 1);
-void writeExtremeKey(uint64_t index, const Int& subtract_value, const Point& found_point, const Int* found_private_key, const Point& origin_point);
+void writeExtremeKey(uint64_t index, const Int& subtract_value, const Point& found_point, 
+                     const Int* found_private_key, const Point& origin_point);
 
 #endif
