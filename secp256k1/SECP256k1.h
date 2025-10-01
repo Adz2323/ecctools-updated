@@ -20,6 +20,7 @@
 
 #include "Point.h"
 #include <vector>
+#include <cstdint>
 
 // Platform-specific SIMD detection
 #ifdef _MSC_VER
@@ -95,27 +96,35 @@ public:
   Int P;     // Prime for the finite field
   Int order; // Curve order
 
-// Fast point halving (division by 2)
-  Point HalvePoint(Point &p);
-  Point HalvePointFast(Point &p);
-  std::vector<Point> BatchHalve(std::vector<Point> &points);
+  // Fast point halving (division by 2) - OPTIMIZED implementations
+  Point HalvePoint(Point &p);                        // Uses scalar multiplication with inverse of 2
+  Point HalvePointFast(Point &p);                    // Alias for HalvePoint (same implementation)
+  std::vector<Point> BatchHalve(const std::vector<Point>& points); // Process multiple halvings at once
     
-    // Batch inversion for optimization
+  // Batch inversion for optimization
   void BatchModInverse(std::vector<Int*> &values, std::vector<Int> &results);
     
-    // Hash function for collision detection
+  // Hash function for collision detection
   uint64_t HashPoint(const Point &p);
     
-    // Optimized subtraction by small values
-  Point SubtractSmall(Point &p, int value);
+  // Optimized subtraction operations
+  Point SubtractSmall(Point &p, int value);          // Fast subtraction for small values
+  Point SubtractG(Point &p);                         // Optimized subtraction of generator point
+  
+  // Additional optimized operations
+  Point MultiplyByPowerOfTwo(Point &p, int power);   // Efficient 2^n multiplication
 
 private:
   uint8_t GetByte(char *str, int idx);
   Point GTable[256 * 32]; // Generator table
 
+  // Optimized values for fast operations
+  static Int inverse_of_2;              // Modular inverse of 2 mod order for fast halving
+  static bool inverse_initialized;       // Flag to track initialization
+  
+  // Half mod values (kept for compatibility but not used in current implementation)
   Int half_mod_p;
   bool half_mod_initialized = false;
-    
   void InitHalfMod();
 
   // SIMD support flags
